@@ -28,14 +28,25 @@ foreach ($qs as $q) {
         $points = $correct ? $questionPoints : 0;
     } elseif ($q['type'] === 'tf') {
         $items = tf_items($q['id']);
-        $ok = 0;
-        foreach ($items as $it) {
-            if (($ans[$it['label']] ?? '') === $it['answer']) $ok++;
+        if (is_array($ans)) {
+            $ok = 0;
+            foreach ($items as $it) {
+                if (($ans[$it['label']] ?? '') === $it['answer']) $ok++;
+            }
+            $ratio = count($items) ? $ok / count($items) : 0;
+            $points = round($questionPoints * $ratio, 2);
+            $correct = $ratio >= 1;
+            $ans = json_encode($ans, JSON_UNESCAPED_UNICODE);
+        } else {
+            $expected = (string)($q['answer'] ?? '');
+            if ($expected === '' && $items) {
+                $expected = (string)($items[0]['answer'] ?? 'true');
+            }
+            $expected = $expected === 'false' ? 'false' : 'true';
+            $ans = in_array((string)$ans, ['true', 'false'], true) ? (string)$ans : '';
+            $correct = $ans !== '' && $ans === $expected;
+            $points = $correct ? $questionPoints : 0;
         }
-        $ratio = count($items) ? $ok / count($items) : 0;
-        $points = round($questionPoints * $ratio, 2);
-        $correct = $ratio >= 1;
-        $ans = json_encode($ans, JSON_UNESCAPED_UNICODE);
     } elseif ($q['type'] === 'sa') {
         $correct = mb_strtolower(trim((string)$ans)) === mb_strtolower(trim((string)$q['answer']));
         $points = $correct ? $questionPoints : 0;

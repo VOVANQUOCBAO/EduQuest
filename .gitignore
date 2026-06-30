@@ -1,1 +1,16 @@
+# API key thật của Gemini (không bao giờ commit)
 config/gemini.local.php
+
+# Dữ liệu upload / ảnh sinh ra lúc chạy (không đưa vào repo code)
+uploads/*
+!uploads/.gitkeep
+
+# Editor / IDE / công cụ
+.idea/
+.vscode/
+.cursor/
+.codegraph/
+
+# Log / tạm
+*.log
+*.tmp

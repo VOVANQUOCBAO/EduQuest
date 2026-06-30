@@ -228,10 +228,17 @@ include __DIR__ . '/includes/header.php';
         </div>
       </div>
       <label>Nội dung câu hỏi</label>
-      <textarea name="content" required><?= e($edit['content'] ?? '') ?></textarea>
+      <div class="question-content-field">
+        <?php if (question_content_has_inline_images($edit['content'] ?? '')): ?>
+          <div class="question-content-render"><?= question_content_html($edit['content'] ?? '') ?></div>
+          <input type="hidden" name="content" value="<?= e($edit['content'] ?? '') ?>">
+        <?php else: ?>
+          <textarea name="content" required><?= e($edit['content'] ?? '') ?></textarea>
+        <?php endif; ?>
+        <?= question_image_tag($edit['image_path'] ?? '') ?>
+      </div>
       <label>Hinh anh kem cau hoi</label>
       <input type="file" name="image_file" accept="image/png,image/jpeg,image/webp,image/gif">
-      <?= question_image_tag($edit['image_path'] ?? '') ?>
       <div class="grid grid-2 question-type-panel" data-panel="mc">
         <div>
           <h3>Đáp án trắc nghiệm</h3>
@@ -255,19 +262,12 @@ include __DIR__ . '/includes/header.php';
         </div>
       </div>
       <div class="question-type-panel" data-panel="tf">
-        <h3>Ý Đúng/Sai</h3>
-        <div class="grid grid-2">
-          <?php foreach (['a', 'b', 'c', 'd'] as $o): ?>
-            <div>
-              <label><?= $o ?>)</label>
-              <input name="tf_items[<?= $o ?>][content]" value="<?= e($editTf[$o]['content'] ?? '') ?>">
-              <select name="tf_items[<?= $o ?>][answer]">
-                <option value="true" <?= ($editTf[$o]['answer'] ?? 'true') === 'true' ? 'selected' : '' ?>>Đúng</option>
-                <option value="false" <?= ($editTf[$o]['answer'] ?? '') === 'false' ? 'selected' : '' ?>>Sai</option>
-              </select>
-            </div>
-          <?php endforeach; ?>
-        </div>
+        <?php $tfAnswer = (string)($edit['answer'] ?? ($editTf['a']['answer'] ?? 'true')); ?>
+        <h3>Đáp án Đúng/Sai</h3>
+        <select name="tf_answer">
+          <option value="true" <?= $tfAnswer !== 'false' ? 'selected' : '' ?>>Đúng</option>
+          <option value="false" <?= $tfAnswer === 'false' ? 'selected' : '' ?>>Sai</option>
+        </select>
       </div>
       <div class="question-type-panel" data-panel="text">
         <label>Đáp án gợi ý / đáp án ngắn</label>

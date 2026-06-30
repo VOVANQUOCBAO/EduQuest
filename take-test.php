@@ -38,17 +38,21 @@ include __DIR__ . '/includes/header.php';
 
     <?php foreach ($qs as $i => $q): ?>
       <div class="question">
-        <strong>Cau <?= $i + 1 ?>:</strong> <span class="muted">(<?= e($q['points']) ?> diem)</span> <?= e(display_question_content($q['content'], $q['image_path'] ?? '')) ?>
+        <strong>Cau <?= $i + 1 ?>:</strong> <span class="muted">(<?= e($q['points']) ?> diem)</span> <?= question_content_html($q['content'], $q['image_path'] ?? '') ?>
         <?= question_image_tag($q['image_path'] ?? '') ?>
 
         <?php if ($q['type'] === 'mc'): ?>
           <?php foreach (question_options($q['id']) as $op): ?>
-            <label class="choice"><input type="radio" name="answer[<?= $q['id'] ?>]" value="<?= e($op['label']) ?>"> <?= e($op['label'] . '. ' . $op['content']) ?></label>
+            <label class="choice"><input type="radio" name="answer[<?= $q['id'] ?>]" value="<?= e($op['label']) ?>"> <?= e($op['label'] . '. ') ?><?= question_content_html($op['content']) ?></label>
           <?php endforeach; ?>
         <?php elseif ($q['type'] === 'tf'): ?>
-          <?php foreach (tf_items($q['id']) as $it): ?>
-            <div class="choice"><?= e($it['label'] . ') ' . $it['content']) ?> <select name="answer[<?= $q['id'] ?>][<?= e($it['label']) ?>]"><option value="true">Dung</option><option value="false">Sai</option></select></div>
-          <?php endforeach; ?>
+          <div class="choice">
+            <select name="answer[<?= $q['id'] ?>]">
+              <option value="">Chon</option>
+              <option value="true">Dung</option>
+              <option value="false">Sai</option>
+            </select>
+          </div>
         <?php else: ?>
           <textarea name="answer[<?= $q['id'] ?>]" placeholder="Nhap cau tra loi"></textarea>
         <?php endif; ?>

@@ -196,6 +196,31 @@ function display_question_content(?string $content, ?string $imagePath = ''): st
     if (preg_match('/(^|\|)uploads\/questions\/question-block-/i', (string)$imagePath)) return '';
     return is_image_question_placeholder($content) ? '' : trim((string)$content);
 }
+function question_content_has_inline_images(?string $content): bool {
+    return (bool)preg_match('/\[image:\s*.+?\s*\]/iu', (string)$content);
+}
+function question_content_html(?string $content, ?string $imagePath = ''): string {
+    $content = display_question_content($content, $imagePath);
+    if ($content === '') return '';
+    $parts = preg_split('/(\[image:\s*.+?\s*\])/iu', $content, -1, PREG_SPLIT_DELIM_CAPTURE);
+    $html = '';
+    foreach ($parts as $part) {
+        if ($part === '') continue;
+        if (preg_match('/^\[image:\s*(.+?)\s*\]$/iu', $part, $m)) {
+            $path = normalize_question_image_path(trim($m[1]));
+            if ($path !== '') {
+                $class = 'question-inline-image';
+                $full = __DIR__ . '/../' . ltrim(str_replace('\\', '/', $path), '/');
+                $size = is_file($full) ? @getimagesize($full) : false;
+                if ($size && ($size[0] >= 140 && $size[1] >= 100)) $class .= ' question-inline-diagram';
+                $html .= '<img class="' . e($class) . '" src="' . e($path) . '" alt="Cong thuc" loading="lazy">';
+            }
+            continue;
+        }
+        $html .= nl2br(e($part));
+    }
+    return $html;
+}
 function normalize_question_image_paths(string $paths, string $fallbackText = ''): array {
     $out = [];
     foreach (preg_split('/\s*\|\s*/', trim($paths), -1, PREG_SPLIT_NO_EMPTY) as $path) {
@@ -375,45 +400,85 @@ function render_pdf_question_clips_to_images(string $path, int $maxQuestions = 1
     $prefix = 'pdf-question-' . date('YmdHis') . '-' . bin2hex(random_bytes(4));
     $script = <<<'PY'
 import fitz, json, os, re, sys
+sys.stdout.reconfigure(encoding="utf-8")
 pdf_path, out_dir, prefix, max_questions = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 doc = fitz.open(pdf_path)
-starts = []
 marker = re.compile(r'^\s*(?:(?:Câu|Cau|Question|Q)\s*\d{1,4}\s*[\.\:\)\-]|\d{1,4}\s*[\.\)]\s+\S)', re.I)
+
+def overlap(a0, a1, b0, b1):
+    return max(0.0, min(a1, b1) - max(a0, b0))
+
+# Mỗi câu hỏi -> một clip bao trọn cả phần chữ lẫn ảnh công thức (kể cả công
+# thức cao vượt lên trên dòng chữ). Gán mỗi ảnh/nét vẽ cho câu mà nó chồng lấn
+# dọc nhiều nhất nên không bị cắt cụt và không lẫn sang câu kế.
+segments = []  # mỗi phần tử: dict(page, lines=[bbox...], y0, y1)
 for page_index in range(doc.page_count):
     page = doc.load_page(page_index)
+    pw, ph = page.rect.width, page.rect.height
     data = page.get_text("dict")
+    lines = []
+    graphics = []
     for block in data.get("blocks", []):
-        for line in block.get("lines", []):
-            text = "".join(span.get("text", "") for span in line.get("spans", [])).strip()
-            if marker.match(text):
-                starts.append((page_index, float(line["bbox"][1])))
-                if len(starts) >= max_questions:
-                    break
-        if len(starts) >= max_questions:
-            break
-    if len(starts) >= max_questions:
+        if block.get("type") == 0:
+            for line in block.get("lines", []):
+                text = "".join(span.get("text", "") for span in line.get("spans", [])).strip()
+                lines.append((tuple(line["bbox"]), text))
+        else:
+            graphics.append(tuple(block["bbox"]))
+    for dr in page.get_drawings():
+        r = dr["rect"]
+        graphics.append((r.x0, r.y0, r.x1, r.y1))
+    # Bỏ nét vẽ/ảnh phủ gần kín trang (đường viền, nền) để không làm phình clip
+    graphics = [g for g in graphics
+                if (g[2] - g[0]) < 0.92 * pw and (g[3] - g[1]) < 0.6 * ph]
+    lines.sort(key=lambda L: (round(L[0][1], 1), L[0][0]))
+
+    page_segs = []
+    for bbox, text in lines:
+        if marker.match(text):
+            seg = {"page": page_index, "x0": bbox[0], "y0": bbox[1], "x1": bbox[2], "y1": bbox[3]}
+            page_segs.append(seg)
+        elif page_segs:
+            seg = page_segs[-1]
+            seg["x0"] = min(seg["x0"], bbox[0]); seg["y0"] = min(seg["y0"], bbox[1])
+            seg["x1"] = max(seg["x1"], bbox[2]); seg["y1"] = max(seg["y1"], bbox[3])
+    # Gán ảnh/công thức cho câu chồng lấn dọc nhiều nhất trong cùng trang
+    for g in graphics:
+        best, best_ov = None, 0.0
+        for seg in page_segs:
+            ov = overlap(g[1], g[3], seg["y0"], seg["y1"])
+            if ov > best_ov:
+                best, best_ov = seg, ov
+        if best is None and page_segs:
+            gc = (g[1] + g[3]) / 2.0
+            best = min(page_segs, key=lambda s: abs((s["y0"] + s["y1"]) / 2.0 - gc))
+        if best is not None:
+            best["x0"] = min(best["x0"], g[0]); best["y0"] = min(best["y0"], g[1])
+            best["x1"] = max(best["x1"], g[2]); best["y1"] = max(best["y1"], g[3])
+    segments.extend(page_segs)
+    if len(segments) >= max_questions:
+        segments = segments[:max_questions]
         break
 
 paths = []
 zoom = fitz.Matrix(2, 2)
-for idx, (page_index, y0) in enumerate(starts):
-    page = doc.load_page(page_index)
+for idx, seg in enumerate(segments):
+    page = doc.load_page(seg["page"])
     rect = page.rect
-    next_y = rect.y1
-    if idx + 1 < len(starts) and starts[idx + 1][0] == page_index:
-        next_y = max(y0 + 28, starts[idx + 1][1] - 6)
-    clip = fitz.Rect(rect.x0 + 4, max(rect.y0, y0 - 8), rect.x1 - 4, min(rect.y1, next_y))
-    if clip.height < 24:
+    pad = 5.0
+    clip = fitz.Rect(
+        max(rect.x0, seg["x0"] - pad), max(rect.y0, seg["y0"] - pad),
+        min(rect.x1, seg["x1"] + pad), min(rect.y1, seg["y1"] + pad))
+    if clip.height < 12 or clip.width < 12:
         continue
     pix = page.get_pixmap(matrix=zoom, clip=clip, alpha=False)
     name = f"{prefix}-{idx + 1}.png"
-    full = os.path.join(out_dir, name)
-    pix.save(full)
+    pix.save(os.path.join(out_dir, name))
     paths.append("uploads/questions/" + name)
 print(json.dumps(paths, ensure_ascii=False))
 PY;
     $cmd = ['python', '-c', $script, $path, $dir, $prefix, (string)$maxQuestions];
-    $raw = run_command_with_timeout($cmd, 20);
+    $raw = run_command_with_timeout($cmd, 40);
     $paths = json_decode(trim((string)$raw), true);
     return is_array($paths) ? array_values(array_filter($paths, fn($p) => is_string($p) && $p !== '')) : [];
 }
@@ -754,6 +819,10 @@ function save_import_question_block_images(string $text): array {
     $paths = [];
     foreach ($blocks as $i => $block) {
         if (!preg_match('/\[image:/i', $block)) continue;
+        continue;
+        // Ảnh clip nguyên-câu từ PDF (LibreOffice) đã là ảnh đầy đủ của câu hỏi;
+        // không bake lại thành ảnh text-snapshot PIL kẻo bị trùng/lặp text.
+        if (preg_match('~\[image:[^\]]*(?:pdf-question-|pdf-page-)~i', $block)) continue;
         $path = save_question_block_image_from_text($block, $i + 1);
         if ($path) $paths[$i] = $path;
     }
@@ -767,20 +836,134 @@ function convert_docx_to_pdf(string $docxPath): ?string {
     $inputPath = $outDir . DIRECTORY_SEPARATOR . 'source.docx';
     copy($docxPath, $inputPath);
     $pdfPath = $outDir . DIRECTORY_SEPARATOR . 'source.pdf';
+    // Profile riêng (KHÔNG dùng profile mặc định để tránh đụng quickstarter làm
+    // soffice crash 0xC0000409). Dùng lại một profile cố định cho lần sau chỉ mất
+    // ~3s thay vì ~17s khởi tạo mới mỗi lần.
+    $profileDir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'eduquest-lo-profile';
+    if (!is_dir($profileDir)) @mkdir($profileDir, 0777, true);
+    $profile = 'file:///' . str_replace('\\', '/', $profileDir);
 
-    $officeCandidates = [
+    // Trên Windows phải dùng soffice.com (console, chạy đồng bộ); soffice.exe là
+    // launcher tách tiến trình nên trả về ngay trước khi tạo xong PDF.
+    $isWindows = stripos(PHP_OS_FAMILY, 'Windows') !== false;
+    $officeCandidates = $isWindows ? [
+        'C:\\Program Files\\LibreOffice\\program\\soffice.com',
+        'C:\\Program Files (x86)\\LibreOffice\\program\\soffice.com',
+        'soffice.com',
+        'soffice.exe',
+    ] : [
         'soffice',
         'libreoffice',
-        'C:\\Program Files\\LibreOffice\\program\\soffice.exe',
-        'C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe',
     ];
     foreach ($officeCandidates as $office) {
-        $cmd = [$office, '--headless', '--convert-to', 'pdf', '--outdir', $outDir, $inputPath];
-        run_command_with_timeout($cmd, 20);
+        $cmd = [$office, '-env:UserInstallation=' . $profile, '--headless', '--norestore', '--convert-to', 'pdf', '--outdir', $outDir, $inputPath];
+        run_command_with_timeout($cmd, 90);
         if (is_file($pdfPath)) return $pdfPath;
     }
 
     return null;
+}
+
+function docx_media_zip_path(string $target): string {
+    $target = str_replace('\\', '/', $target);
+    return str_starts_with($target, '/') ? ltrim($target, '/') : 'word/' . ltrim($target, '/');
+}
+
+function docx_inline_text_from_tokens(array $tokens): string {
+    $out = '';
+    foreach ($tokens as $token) {
+        if (($token['type'] ?? '') === 'image') {
+            $path = trim((string)($token['path'] ?? ''));
+            if ($path !== '') {
+                $out = rtrim($out);
+                $out .= ' [image:' . $path . '] ';
+            }
+            continue;
+        }
+        $out .= (string)($token['text'] ?? '');
+    }
+    return trim(preg_replace('/[ \t]+/u', ' ', $out));
+}
+
+function extract_docx_text_with_inline_media(string $path): string {
+    $zip = new ZipArchive();
+    if ($zip->open($path) !== true) return '';
+    $xml = $zip->getFromName('word/document.xml');
+    $relsXml = $zip->getFromName('word/_rels/document.xml.rels');
+    if (!$xml) {
+        $zip->close();
+        return '';
+    }
+
+    $rels = [];
+    if ($relsXml) {
+        $relsDoc = new DOMDocument();
+        if (@$relsDoc->loadXML($relsXml)) {
+            foreach ($relsDoc->getElementsByTagName('Relationship') as $rel) {
+                if (str_contains((string)$rel->getAttribute('Type'), '/image')) {
+                    $rels[(string)$rel->getAttribute('Id')] = (string)$rel->getAttribute('Target');
+                }
+            }
+        }
+    }
+
+    $doc = new DOMDocument();
+    if (!@$doc->loadXML($xml)) {
+        $zip->close();
+        return trim(html_entity_decode(strip_tags(str_replace('</w:p>', "\n", $xml)), ENT_QUOTES | ENT_XML1, 'UTF-8'));
+    }
+
+    $xp = new DOMXPath($doc);
+    $xp->registerNamespace('w', 'http://schemas.openxmlformats.org/wordprocessingml/2006/main');
+    $xp->registerNamespace('a', 'http://schemas.openxmlformats.org/drawingml/2006/main');
+    $xp->registerNamespace('m', 'http://schemas.openxmlformats.org/officeDocument/2006/math');
+    $xp->registerNamespace('r', 'http://schemas.openxmlformats.org/officeDocument/2006/relationships');
+    $xp->registerNamespace('v', 'urn:schemas-microsoft-com:vml');
+
+    $out = [];
+    foreach ($xp->query('//w:body//w:tbl//w:tr') as $tr) {
+        $cells = [];
+        foreach ($xp->query('./w:tc', $tr) as $tc) {
+            $parts = [];
+            foreach ($xp->query('.//w:t|.//m:t', $tc) as $t) $parts[] = $t->textContent;
+            $cellText = trim(html_entity_decode(implode('', $parts), ENT_QUOTES | ENT_XML1, 'UTF-8'));
+            if ($cellText !== '') $cells[] = $cellText;
+        }
+        if (count($cells) >= 2) $out[] = implode('|', $cells);
+    }
+
+    foreach ($xp->query('//w:body//w:p') as $p) {
+        $tokens = [];
+        foreach ($xp->query('./w:r|./m:oMathPara|./m:oMath', $p) as $node) {
+            if ($node->localName === 'oMath' || $node->localName === 'oMathPara') {
+                $formulaParts = [];
+                foreach ($xp->query('.//m:t', $node) as $t) $formulaParts[] = $t->textContent;
+                $formulaText = trim(html_entity_decode(implode(' ', $formulaParts), ENT_QUOTES | ENT_XML1, 'UTF-8'));
+                if ($formulaText !== '') $tokens[] = ['type' => 'text', 'text' => $formulaText];
+                continue;
+            }
+
+            $runTextParts = [];
+            foreach ($xp->query('.//w:t', $node) as $t) $runTextParts[] = $t->textContent;
+            $runText = html_entity_decode(implode('', $runTextParts), ENT_QUOTES | ENT_XML1, 'UTF-8');
+            if ($runText !== '') $tokens[] = ['type' => 'text', 'text' => $runText];
+
+            foreach ($xp->query('.//a:blip|.//v:imagedata', $node) as $blip) {
+                $rid = $blip->getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships', 'embed')
+                    ?: $blip->getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships', 'id');
+                if ($rid === '' || empty($rels[$rid])) continue;
+                $image = $zip->getFromName(docx_media_zip_path($rels[$rid]));
+                if ($image === false) continue;
+                $imagePath = save_question_image_bytes($image, basename($rels[$rid]), docx_inline_text_from_tokens($tokens));
+                if ($imagePath) $tokens[] = ['type' => 'image', 'path' => $imagePath];
+            }
+        }
+        $line = docx_inline_text_from_tokens($tokens);
+        if ($line !== '') $out[] = $line;
+    }
+
+    $zip->close();
+    return trim(implode("\n", $out));
 }
 
 function force_import_questions_as_images(array $questions): array {
@@ -1122,9 +1305,12 @@ function question_form_payload(array $src): array {
         $type = $hasOptions ? 'mc' : ($hasTfItems ? 'tf' : 'essay');
     }
     $finalType = in_array($type, ['mc','tf','sa','essay'], true) ? $type : 'mc';
-    $answerValue = in_array($finalType, ['sa', 'essay'], true)
+    $rawTfAnswer = strtolower(trim((string)($src['tf_answer'] ?? $src['answer'] ?? $src['answer_text'] ?? 'true')));
+    $answerValue = $finalType === 'tf'
+        ? (in_array($rawTfAnswer, ['false', 'sai', 's', '0', 'no'], true) ? 'false' : 'true')
+        : (in_array($finalType, ['sa', 'essay'], true)
         ? trim($src['answer_text'] ?? $src['answer'] ?? '')
-        : trim($src['answer'] ?? $src['answer_text'] ?? '');
+        : trim($src['answer'] ?? $src['answer_text'] ?? ''));
     $data = [
         'subject_id' => (int)($src['subject_id'] ?? 0),
         'lesson_id' => ($src['lesson_id'] ?? '') === '__new__' ? 0 : (int)($src['lesson_id'] ?? 0),
@@ -1149,9 +1335,13 @@ function question_form_payload(array $src): array {
         if (!isset($options[$l])) $options[$l] = '';
     }
     $tfItems = [];
-    foreach (['a','b','c','d'] as $l) {
-        $content = trim($src['tf_items'][$l]['content'] ?? $src['tf_'.$l] ?? '');
-        if ($content !== '') $tfItems[] = ['label'=>$l,'content'=>$content,'answer'=>$src['tf_items'][$l]['answer'] ?? $src['tf_ans_'.$l] ?? 'true','difficulty'=>$src['tf_items'][$l]['difficulty'] ?? $data['difficulty']];
+    if ($finalType === 'tf') {
+        $tfItems[] = ['label'=>'a','content'=>$data['content'],'answer'=>$answerValue === 'false' ? 'false' : 'true','difficulty'=>$data['difficulty']];
+    } else {
+        foreach (['a','b','c','d'] as $l) {
+            $content = trim($src['tf_items'][$l]['content'] ?? $src['tf_'.$l] ?? '');
+            if ($content !== '') $tfItems[] = ['label'=>$l,'content'=>$content,'answer'=>$src['tf_items'][$l]['answer'] ?? $src['tf_ans_'.$l] ?? 'true','difficulty'=>$src['tf_items'][$l]['difficulty'] ?? $data['difficulty']];
+        }
     }
     return [$data, $options, $tfItems];
 }
@@ -1481,8 +1671,9 @@ function gemini_question_prompt(string $text, string $type, int $count, string $
         . "- Do not rewrite math notation based on your guess.\n"
         . "- If a question contains a diagram/image or unreadable symbols from an image, set has_image=true and needs_review=true.\n"
         . "- When images are attached, set source_image_index to the main 1-based Image number that contains the question. If a question uses multiple attached images/formula fragments, also set source_image_indices to all relevant image numbers.\n"
+        . "- For true/false questions, put the statement in content and put exactly one answer value in answer: true or false. Do not create a,b,c,d true/false sub-items.\n"
         . "- Return valid JSON only, no markdown fences and no explanation outside JSON.\n"
-        . "JSON schema: {\"questions\":[{\"type\":\"mc|tf|sa|essay\",\"question_text\":\"\",\"content\":\"\",\"has_image\":false,\"source_image_index\":1,\"source_image_indices\":[1],\"image_note\":\"\",\"options\":[{\"label\":\"A\",\"text\":\"\"},{\"label\":\"B\",\"text\":\"\"},{\"label\":\"C\",\"text\":\"\"},{\"label\":\"D\",\"text\":\"\"}],\"tf_items\":[{\"label\":\"a\",\"content\":\"\",\"answer\":\"true\"}],\"correct_answer\":\"\",\"answer\":\"\",\"difficulty\":\"easy|medium|hard|unknown\",\"explanation\":\"\",\"needs_review\":false}]}.\n"
+        . "JSON schema: {\"questions\":[{\"type\":\"mc|tf|sa|essay\",\"question_text\":\"\",\"content\":\"\",\"has_image\":false,\"source_image_index\":1,\"source_image_indices\":[1],\"image_note\":\"\",\"options\":[{\"label\":\"A\",\"text\":\"\"},{\"label\":\"B\",\"text\":\"\"},{\"label\":\"C\",\"text\":\"\"},{\"label\":\"D\",\"text\":\"\"}],\"correct_answer\":\"\",\"answer\":\"A|true|false|short answer\",\"difficulty\":\"easy|medium|hard|unknown\",\"explanation\":\"\",\"needs_review\":false}]}.\n"
         . "Context text, if any:\n" . mb_substr($text, 0, 12000);
 }
 
@@ -1765,6 +1956,7 @@ function import_match_text(string $text): string {
 
 function is_import_question_line(string $line): bool {
     $line = trim($line);
+    $line = preg_replace('/^(?:\[image:\s*.+?\s*\]\s*)+/iu', '', $line);
     if (preg_match('/^(?:cau|câu|question|q)\s*\d{1,4}\s*[\.\:\)\-]/iu', $line)) return true;
     if (preg_match('/^\d{1,4}\s*[\.\)]\s+\S/u', $line)) return true;
     return false;
@@ -1772,8 +1964,14 @@ function is_import_question_line(string $line): bool {
 
 function strip_import_question_prefix(string $line): string {
     $line = trim($line);
+    $leadingImages = '';
+    if (preg_match('/^((?:\[image:\s*.+?\s*\]\s*)+)/iu', $line, $m)) {
+        $leadingImages = trim($m[1]);
+        $line = trim(substr($line, strlen($m[0])));
+    }
     $line = preg_replace('/^(?:cau|câu|question|q)\s*\d{1,4}\s*[\.\:\)\-]\s*/iu', '', $line);
     $line = preg_replace('/^\d{1,4}\s*[\.\)]\s*/u', '', (string)$line);
+    if ($leadingImages !== '') $line = $leadingImages . ' ' . trim((string)$line);
     return trim((string)$line);
 }
 
@@ -2193,7 +2391,8 @@ function finalize_import_preview_questions(array $questions, string $sourceText 
         $question['type'] = in_array(($question['type'] ?? ''), question_types(), true) ? $question['type'] : 'essay';
         $question['content'] = trim((string)($question['content'] ?? ''));
         $question['image_path'] = implode('|', normalize_question_image_paths((string)($question['image_path'] ?? ''), $question['content']));
-        $question['difficulty'] = in_array(($question['difficulty'] ?? 'unknown'), ['easy','medium','hard','unknown'], true) ? $question['difficulty'] : 'unknown';
+        $rawDifficulty = $question['difficulty'] ?? 'unknown';
+        $question['difficulty'] = in_array($rawDifficulty, ['easy','medium','hard','unknown'], true) ? $rawDifficulty : 'unknown';
         $question['answer'] = trim((string)($question['answer'] ?? ''));
         $question['explanation'] = trim((string)($question['explanation'] ?? ''));
         $question['options'] = is_array($question['options'] ?? null) ? $question['options'] : [];
@@ -2202,10 +2401,26 @@ function finalize_import_preview_questions(array $questions, string $sourceText 
         apply_inline_question_parts($question);
         if (($question['type'] ?? '') === 'essay' && !empty(array_filter($question['options'], fn($v) => trim((string)$v) !== ''))) $question['type'] = 'mc';
         if (($question['type'] ?? '') === 'essay' && !empty($question['tf_items'])) $question['type'] = 'tf';
+        // Câu tự luận nhưng kèm đáp án ngắn gọn (1 từ/cụm ngắn, không có ảnh inline)
+        // -> coi là "trả lời ngắn" (sa) để chấm tự động theo đáp án.
+        if (($question['type'] ?? '') === 'essay') {
+            $ans = trim((string)($question['answer'] ?? ''));
+            $wordCount = $ans === '' ? 0 : count(preg_split('/\s+/u', $ans));
+            if ($ans !== '' && mb_strlen($ans) <= 40 && $wordCount <= 6
+                && strpos($ans, "\n") === false && !question_content_has_inline_images($ans)) {
+                $question['type'] = 'sa';
+            }
+        }
 
         if ($question['type'] === 'mc') {
             foreach (mc_option_labels($question['options'], $question['answer']) as $label) {
-                $question['options'][$label] = trim((string)($question['options'][$label] ?? $question['options'][strtolower($label)] ?? ''));
+                $val = trim((string)($question['options'][$label] ?? $question['options'][strtolower($label)] ?? ''));
+                // Đáp án là ảnh công thức (WMF) thì chỉ còn lại dấu câu vụn ("." hoặc
+                // lẫn nhãn phương án khác như ". C. . D. .") -> để trống cho gọn,
+                // giáo viên nhìn ảnh câu hỏi để biết phương án.
+                $probe = preg_replace('/[A-Z]\s*[.\):]/u', '', $val);
+                if (preg_match('/^[\s.,;:·•\-–—]*$/u', (string)$probe)) $val = '';
+                $question['options'][$label] = $val;
             }
             if (preg_match('/[A-Z]/i', $question['answer'], $m)) $question['answer'] = strtoupper($m[0]);
             if (!preg_match('/^[A-Z]$/', $question['answer'])) $question['answer'] = 'A';
@@ -2213,6 +2428,18 @@ function finalize_import_preview_questions(array $questions, string $sourceText 
 
         if ($question['type'] === 'tf') {
             apply_tf_answer_map($question, $question['answer']);
+            $tfAnswer = strtolower(trim($question['answer']));
+            if (in_array($tfAnswer, ['false', 'sai', 's', '0', 'no'], true)) {
+                $question['answer'] = 'false';
+            } elseif (in_array($tfAnswer, ['true', 'dung', 'đúng', 'd', '1', 'yes'], true)) {
+                $question['answer'] = 'true';
+            } else {
+                $firstTf = $question['tf_items'] ? reset($question['tf_items']) : [];
+                $question['answer'] = (($firstTf['answer'] ?? 'true') === 'false') ? 'false' : 'true';
+            }
+            // Mô hình Đúng/Sai dùng một đáp án duy nhất; bỏ tf_items để preview/editor
+            // không còn dữ liệu cũ (4 ý a/b/c/d kèm marker ảnh thô).
+            $question['tf_items'] = [];
         }
 
         if ($question['content'] === '' && $question['image_path'] !== '') $question['content'] = 'Cau hoi bang hinh anh ' . ($i + 1);
@@ -2234,12 +2461,18 @@ function preserve_import_source_images(array $questions, string $sourceText = ''
 
     $allImages = import_image_paths_from_text($sourceText);
     if ($allImages) {
+        $assignedImages = [];
+        foreach ($questions as $question) {
+            foreach (normalize_question_image_paths((string)($question['image_path'] ?? ''), (string)($question['content'] ?? '')) as $path) {
+                $assignedImages[$path] = true;
+            }
+        }
         foreach ($questions as $i => &$question) {
             $paths = normalize_question_image_paths((string)($question['image_path'] ?? ''), (string)($question['content'] ?? ''));
-            if (!$paths && isset($allImages[$i])) {
+            if (!$paths && isset($allImages[$i]) && empty($assignedImages[$allImages[$i]])) {
                 $paths[] = $allImages[$i];
             } elseif (!$paths && count($questions) === 1) {
-                $paths = $allImages;
+                $paths = array_values(array_filter($allImages, fn($path) => empty($assignedImages[$path])));
             }
             $question['image_path'] = implode('|', array_values(array_unique(array_filter($paths))));
             if ($question['image_path'] !== '') $question['needs_review'] = (int)($question['needs_review'] ?? 1);
@@ -2271,6 +2504,9 @@ function extract_upload_text(array $file): string {
         return $text;
     }
     if ($ext === 'docx') {
+        $docxText = extract_docx_text_with_inline_media($file['tmp_name']);
+        if ($docxText !== '') return $docxText;
+
         $pdfPath = convert_docx_to_pdf($file['tmp_name']);
         if ($pdfPath) {
             $text = extract_pdf_text($pdfPath);
@@ -2368,11 +2604,10 @@ function extract_upload_text(array $file): string {
                 if ($hasInlineMedia && $tokens) {
                     $inlinePath = save_question_inline_tokens_image($tokens, (int)$pIndex + 1);
                     if ($inlinePath) {
-                        if (is_import_question_line($line)) {
-                            $out[] = preg_replace('/' . preg_quote(strip_import_question_prefix($line), '/') . '$/u', '', $line) ?: $line;
-                        } elseif ($line !== '') {
-                            $out[] = $line;
-                        }
+                        // Giữ nguyên text của đoạn (gồm cả text công thức đã trích từ m:t)
+                        // để câu hỏi/đáp án vẫn nhận đúng vị trí; ảnh công thức được đính
+                        // ngay sau đó nên gắn vào đúng câu này.
+                        if ($line !== '') $out[] = $line;
                         $out[] = '[image:' . $inlinePath . ']';
                         continue;
                     }
@@ -2403,7 +2638,7 @@ function extract_pdf_text_with_pdftotext(string $path): string {
 }
 
 function extract_pdf_text_with_python(string $path): string {
-    $script = 'import sys, importlib.util; p=sys.argv[1]; text="";'
+    $script = 'import sys, importlib.util; sys.stdout.reconfigure(encoding="utf-8"); p=sys.argv[1]; text="";'
         . "\nif importlib.util.find_spec('fitz'):\n import fitz\n d=fitz.open(p)\n text='\\n'.join(page.get_text() for page in d)"
         . "\nelif importlib.util.find_spec('pypdf'):\n from pypdf import PdfReader\n r=PdfReader(p)\n text='\\n'.join((page.extract_text() or '') for page in r.pages)"
         . "\nprint(text)";
@@ -2498,7 +2733,7 @@ function auto_generate_questions(string $text, string $type, int $count): array 
         $s = trim($sentences[$i]);
         $qType = $type === 'mixed' ? $types[$i % count($types)] : $type;
         if ($qType === 'mc') $result[] = ['type'=>'mc','content'=>'Theo tài liệu, nội dung nào sau đây là đúng: ' . $s, 'difficulty'=>'medium','answer'=>'A','options'=>['A'=>$s,'B'=>'Một nhận định không phù hợp với tài liệu','C'=>'Một nội dung không được đề cập','D'=>'Tất cả các đáp án trên đều sai']];
-        elseif ($qType === 'tf') $result[] = ['type'=>'tf','content'=>'Đánh giá nhận định sau dựa trên tài liệu.', 'difficulty'=>'medium','answer'=>'a-Đúng','tf_items'=>['a'=>['label'=>'a','content'=>$s,'answer'=>'true','difficulty'=>'medium'],'b'=>['label'=>'b','content'=>'Nội dung trên không xuất hiện trong tài liệu.','answer'=>'false','difficulty'=>'easy']]];
+        elseif ($qType === 'tf') $result[] = ['type'=>'tf','content'=>$s, 'difficulty'=>'medium','answer'=>'true','tf_items'=>[]];
         elseif ($qType === 'sa') $result[] = ['type'=>'sa','content'=>'Trình bày ngắn gọn ý chính của đoạn: ' . $s, 'difficulty'=>'medium','answer'=>$s];
         else $result[] = ['type'=>'essay','content'=>'Phân tích và mở rộng ý sau dựa trên tài liệu: ' . $s, 'difficulty'=>'hard','answer'=>'Học sinh trình bày đúng trọng tâm, có dẫn chứng và lập luận rõ ràng.'];
     }
