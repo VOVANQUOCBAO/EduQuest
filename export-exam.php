@@ -1,0 +1,1 @@
+<?php require_once __DIR__.'/includes/functions.php'; require_login(); $_GET['id']=(int)($_GET['id']??0); ob_start(); include __DIR__.'/exam-view.php'; $html=ob_get_clean(); header('Content-Type: application/msword; charset=utf-8'); header('Content-Disposition: attachment; filename="de-thi-'.$_GET['id'].'.doc"'); echo $html;
