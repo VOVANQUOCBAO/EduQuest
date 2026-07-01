@@ -17,7 +17,7 @@ $headerNotifications = $user ? user_notifications((int)$user['id'], 8) : [];
   <link rel="apple-touch-icon" sizes="180x180" href="img/apple-touch-icon.png?v=20260630">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Material+Symbols+Outlined" rel="stylesheet">
-  <link rel="stylesheet" href="assets/css/style.css?v=20260629-user-activity-dashboard">
+  <link rel="stylesheet" href="assets/css/style.css?v=20260701-inline-formula-zoom">
 </head>
 <body>
 <?php if ($user): ?>

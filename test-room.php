@@ -62,13 +62,23 @@ include __DIR__ . '/includes/header.php';
     </div>
     <?php foreach ($qs as $i => $q): ?>
       <div class="question" id="q<?= $i + 1 ?>">
-        <strong>Câu <?= $i + 1 ?>:</strong> <span class="muted">(<?= e($q['points']) ?> điểm)</span> <?= e(display_question_content($q['content'], $q['image_path'] ?? '')) ?>
+        <strong>Câu <?= $i + 1 ?>:</strong> <span class="muted">(<?= e($q['points']) ?> điểm)</span> <?= question_content_html($q['content'], $q['image_path'] ?? '') ?>
         <?= question_image_tag($q['image_path'] ?? '') ?>
         <?php if ($q['type'] === 'mc'): foreach (question_options($q['id']) as $op): ?>
-          <label class="choice"><input data-answer-input="<?= $q['id'] ?>" type="radio" name="answer[<?= $q['id'] ?>]" value="<?= e($op['label']) ?>"> <?= e($op['label'] . '. ' . $op['content']) ?></label>
-        <?php endforeach; elseif ($q['type'] === 'tf'): foreach (tf_items($q['id']) as $it): ?>
-          <div class="choice"><?= e($it['label'] . ') ' . $it['content']) ?> <select data-answer-input="<?= $q['id'] ?>" name="answer[<?= $q['id'] ?>][<?= e($it['label']) ?>]"><option value="">Chọn</option><option value="true">Đúng</option><option value="false">Sai</option></select></div>
-        <?php endforeach; elseif ($q['type'] === 'sa'): ?>
+          <label class="choice"><input data-answer-input="<?= $q['id'] ?>" type="radio" name="answer[<?= $q['id'] ?>]" value="<?= e($op['label']) ?>"> <?= e($op['label'] . '. ') ?><?= question_content_html($op['content']) ?></label>
+        <?php endforeach; elseif ($q['type'] === 'tf'): ?>
+          <?php $tfItems = tf_items((int)$q['id']) ?: [['label'=>'a','content'=>$q['content'],'answer'=>$q['answer'] ?? 'true']]; ?>
+          <?php foreach ($tfItems as $it): ?>
+            <label class="choice">
+              <span><?= e($it['label'] . '. ') ?><?= question_content_html($it['content']) ?></span>
+              <select data-answer-input="<?= $q['id'] ?>" name="answer[<?= $q['id'] ?>][<?= e($it['label']) ?>]">
+                <option value="">Chọn</option>
+                <option value="true">Đúng</option>
+                <option value="false">Sai</option>
+              </select>
+            </label>
+          <?php endforeach; ?>
+        <?php elseif ($q['type'] === 'sa'): ?>
           <input data-answer-input="<?= $q['id'] ?>" name="answer[<?= $q['id'] ?>]" placeholder="Nhập câu trả lời ngắn">
         <?php else: ?>
           <textarea data-answer-input="<?= $q['id'] ?>" name="answer[<?= $q['id'] ?>]" placeholder="Nhập bài làm tự luận"></textarea>

@@ -36,7 +36,7 @@ include __DIR__ . '/includes/header.php';
       <div class="login-copy">
         <span class="eyebrow">Cổng người dùng</span>
         <h1>Đăng nhập dành cho giáo viên và học sinh.</h1>
-        <p>Giáo viên quản lý câu hỏi, tạo đề thi. Học sinh tham gia bài kiểm tra trực tuyến và xem kết quả theo quyền được cấp.</p>
+        <p>EduQuest cổng hệ thống dành cho Giáo viên và Học sinh</p>
       </div>
 
       <div class="login-metrics">

@@ -196,6 +196,31 @@ function display_question_content(?string $content, ?string $imagePath = ''): st
     if (preg_match('/(^|\|)uploads\/questions\/question-block-/i', (string)$imagePath)) return '';
     return is_image_question_placeholder($content) ? '' : trim((string)$content);
 }
+function question_content_has_inline_images(?string $content): bool {
+    return (bool)preg_match('/\[image:\s*.+?\s*\]/iu', (string)$content);
+}
+function question_content_html(?string $content, ?string $imagePath = ''): string {
+    $content = display_question_content($content, $imagePath);
+    if ($content === '') return '';
+    $parts = preg_split('/(\[image:\s*.+?\s*\])/iu', $content, -1, PREG_SPLIT_DELIM_CAPTURE);
+    $html = '';
+    foreach ($parts as $part) {
+        if ($part === '') continue;
+        if (preg_match('/^\[image:\s*(.+?)\s*\]$/iu', $part, $m)) {
+            $path = normalize_question_image_path(trim($m[1]));
+            if ($path !== '') {
+                $class = 'question-inline-image';
+                $full = __DIR__ . '/../' . ltrim(str_replace('\\', '/', $path), '/');
+                $size = is_file($full) ? @getimagesize($full) : false;
+                if ($size && ($size[0] >= 140 && $size[1] >= 100)) $class .= ' question-inline-diagram';
+                $html .= '<img class="' . e($class) . '" src="' . e($path) . '" alt="Cong thuc" loading="lazy">';
+            }
+            continue;
+        }
+        $html .= nl2br(e($part));
+    }
+    return $html;
+}
 function normalize_question_image_paths(string $paths, string $fallbackText = ''): array {
     $out = [];
     foreach (preg_split('/\s*\|\s*/', trim($paths), -1, PREG_SPLIT_NO_EMPTY) as $path) {
@@ -261,7 +286,10 @@ function save_question_image_bytes(string $bytes, string $originalName = '', str
         $metaPath = $dir . '/' . $base . '.' . $ext;
         $pngPath = $dir . '/' . $base . '.png';
         file_put_contents($metaPath, $bytes);
-        if (convert_windows_metafile_to_png($metaPath, $pngPath)) {
+        // Uu tien Imagick (chay pure-PHP, khong can proc_open) — hoat dong tren
+        // nhieu shared host ke ca InfinityFree khi co delegate; sau do moi thu
+        // convert bang cong cu ngoai (chi Windows/local).
+        if (convert_metafile_with_imagick($bytes, $pngPath) || convert_windows_metafile_to_png($metaPath, $pngPath)) {
             @unlink($metaPath);
             return 'uploads/questions/' . $base . '.png';
         }
@@ -298,8 +326,23 @@ function save_question_formula_image(string $formulaText, string $contextText = 
     return 'uploads/questions/' . $base . '.svg';
 }
 
+function is_shared_hosting_runtime(): bool {
+    $host = strtolower((string)($_SERVER['HTTP_HOST'] ?? ''));
+    return $host !== '' && (
+        str_contains($host, 'infinityfree')
+        || str_contains($host, 'site.je')
+        || str_contains($host, 'rf.gd')
+        || str_contains($host, '42web.io')
+        || str_contains($host, 'epizy.com')
+    );
+}
+
+function can_run_external_import_tools(): bool {
+    return !is_shared_hosting_runtime() && function_exists('proc_open');
+}
+
 function run_command_with_timeout($cmd, int $timeoutSeconds = 15): string {
-    if (!function_exists('proc_open')) return '';
+    if (!can_run_external_import_tools()) return '';
     $outPath = tempnam(sys_get_temp_dir(), 'eq-cmd-out-');
     $errPath = tempnam(sys_get_temp_dir(), 'eq-cmd-err-');
     if ($outPath === false || $errPath === false) return '';
@@ -343,7 +386,8 @@ function run_command_with_timeout($cmd, int $timeoutSeconds = 15): string {
     return $output;
 }
 
-function render_pdf_pages_to_question_images(string $path, int $maxPages = 30): array {
+function render_pdf_pages_to_question_images(string $path, int $maxPages = 500): array {
+    if (!can_run_external_import_tools()) return [];
     if (!is_file($path)) return [];
     $dir = __DIR__ . '/../uploads/questions';
     if (!is_dir($dir)) mkdir($dir, 0777, true);
@@ -363,57 +407,98 @@ for i in range(min(max_pages, doc.page_count)):
 print(json.dumps(paths))
 PY;
     $cmd = ['python', '-c', $script, $path, $dir, $prefix, (string)$maxPages];
-    $raw = run_command_with_timeout($cmd, 20);
+    $raw = run_command_with_timeout($cmd, 90);
     $paths = json_decode(trim((string)$raw), true);
     return is_array($paths) ? array_values(array_filter($paths, fn($p) => is_string($p) && $p !== '')) : [];
 }
 
-function render_pdf_question_clips_to_images(string $path, int $maxQuestions = 120): array {
+function render_pdf_question_clips_to_images(string $path, int $maxQuestions = 1000): array {
+    if (!can_run_external_import_tools()) return [];
     if (!is_file($path)) return [];
     $dir = __DIR__ . '/../uploads/questions';
     if (!is_dir($dir)) mkdir($dir, 0777, true);
     $prefix = 'pdf-question-' . date('YmdHis') . '-' . bin2hex(random_bytes(4));
     $script = <<<'PY'
 import fitz, json, os, re, sys
+sys.stdout.reconfigure(encoding="utf-8")
 pdf_path, out_dir, prefix, max_questions = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 doc = fitz.open(pdf_path)
-starts = []
 marker = re.compile(r'^\s*(?:(?:Câu|Cau|Question|Q)\s*\d{1,4}\s*[\.\:\)\-]|\d{1,4}\s*[\.\)]\s+\S)', re.I)
+
+def overlap(a0, a1, b0, b1):
+    return max(0.0, min(a1, b1) - max(a0, b0))
+
+# Mỗi câu hỏi -> một clip bao trọn cả phần chữ lẫn ảnh công thức (kể cả công
+# thức cao vượt lên trên dòng chữ). Gán mỗi ảnh/nét vẽ cho câu mà nó chồng lấn
+# dọc nhiều nhất nên không bị cắt cụt và không lẫn sang câu kế.
+segments = []  # mỗi phần tử: dict(page, lines=[bbox...], y0, y1)
 for page_index in range(doc.page_count):
     page = doc.load_page(page_index)
+    pw, ph = page.rect.width, page.rect.height
     data = page.get_text("dict")
+    lines = []
+    graphics = []
     for block in data.get("blocks", []):
-        for line in block.get("lines", []):
-            text = "".join(span.get("text", "") for span in line.get("spans", [])).strip()
-            if marker.match(text):
-                starts.append((page_index, float(line["bbox"][1])))
-                if len(starts) >= max_questions:
-                    break
-        if len(starts) >= max_questions:
-            break
-    if len(starts) >= max_questions:
+        if block.get("type") == 0:
+            for line in block.get("lines", []):
+                text = "".join(span.get("text", "") for span in line.get("spans", [])).strip()
+                lines.append((tuple(line["bbox"]), text))
+        else:
+            graphics.append(tuple(block["bbox"]))
+    for dr in page.get_drawings():
+        r = dr["rect"]
+        graphics.append((r.x0, r.y0, r.x1, r.y1))
+    # Bỏ nét vẽ/ảnh phủ gần kín trang (đường viền, nền) để không làm phình clip
+    graphics = [g for g in graphics
+                if (g[2] - g[0]) < 0.92 * pw and (g[3] - g[1]) < 0.6 * ph]
+    lines.sort(key=lambda L: (round(L[0][1], 1), L[0][0]))
+
+    page_segs = []
+    for bbox, text in lines:
+        if marker.match(text):
+            seg = {"page": page_index, "x0": bbox[0], "y0": bbox[1], "x1": bbox[2], "y1": bbox[3]}
+            page_segs.append(seg)
+        elif page_segs:
+            seg = page_segs[-1]
+            seg["x0"] = min(seg["x0"], bbox[0]); seg["y0"] = min(seg["y0"], bbox[1])
+            seg["x1"] = max(seg["x1"], bbox[2]); seg["y1"] = max(seg["y1"], bbox[3])
+    # Gán ảnh/công thức cho câu chồng lấn dọc nhiều nhất trong cùng trang
+    for g in graphics:
+        best, best_ov = None, 0.0
+        for seg in page_segs:
+            ov = overlap(g[1], g[3], seg["y0"], seg["y1"])
+            if ov > best_ov:
+                best, best_ov = seg, ov
+        if best is None and page_segs:
+            gc = (g[1] + g[3]) / 2.0
+            best = min(page_segs, key=lambda s: abs((s["y0"] + s["y1"]) / 2.0 - gc))
+        if best is not None:
+            best["x0"] = min(best["x0"], g[0]); best["y0"] = min(best["y0"], g[1])
+            best["x1"] = max(best["x1"], g[2]); best["y1"] = max(best["y1"], g[3])
+    segments.extend(page_segs)
+    if len(segments) >= max_questions:
+        segments = segments[:max_questions]
         break
 
 paths = []
 zoom = fitz.Matrix(2, 2)
-for idx, (page_index, y0) in enumerate(starts):
-    page = doc.load_page(page_index)
+for idx, seg in enumerate(segments):
+    page = doc.load_page(seg["page"])
     rect = page.rect
-    next_y = rect.y1
-    if idx + 1 < len(starts) and starts[idx + 1][0] == page_index:
-        next_y = max(y0 + 28, starts[idx + 1][1] - 6)
-    clip = fitz.Rect(rect.x0 + 4, max(rect.y0, y0 - 8), rect.x1 - 4, min(rect.y1, next_y))
-    if clip.height < 24:
+    pad = 5.0
+    clip = fitz.Rect(
+        max(rect.x0, seg["x0"] - pad), max(rect.y0, seg["y0"] - pad),
+        min(rect.x1, seg["x1"] + pad), min(rect.y1, seg["y1"] + pad))
+    if clip.height < 12 or clip.width < 12:
         continue
     pix = page.get_pixmap(matrix=zoom, clip=clip, alpha=False)
     name = f"{prefix}-{idx + 1}.png"
-    full = os.path.join(out_dir, name)
-    pix.save(full)
+    pix.save(os.path.join(out_dir, name))
     paths.append("uploads/questions/" + name)
 print(json.dumps(paths, ensure_ascii=False))
 PY;
     $cmd = ['python', '-c', $script, $path, $dir, $prefix, (string)$maxQuestions];
-    $raw = run_command_with_timeout($cmd, 20);
+    $raw = run_command_with_timeout($cmd, 120);
     $paths = json_decode(trim((string)$raw), true);
     return is_array($paths) ? array_values(array_filter($paths, fn($p) => is_string($p) && $p !== '')) : [];
 }
@@ -520,6 +605,7 @@ function save_question_text_snapshot_image(string $text, int $index = 1): ?strin
 }
 
 function save_question_inline_tokens_image(array $tokens, int $index = 1): ?string {
+    if (!can_run_external_import_tools()) return null;
     $tokens = array_values(array_filter($tokens, fn($token) => !empty($token['text']) || !empty($token['path'])));
     if (!$tokens) return null;
     $dir = __DIR__ . '/../uploads/questions';
@@ -628,6 +714,7 @@ PY;
 }
 
 function save_question_block_image_from_text(string $block, int $index = 1): ?string {
+    if (!can_run_external_import_tools()) return null;
     $lines = preg_split('/\R/u', trim($block), -1, PREG_SPLIT_NO_EMPTY);
     if (!$lines) return null;
     $payload = [];
@@ -754,6 +841,10 @@ function save_import_question_block_images(string $text): array {
     $paths = [];
     foreach ($blocks as $i => $block) {
         if (!preg_match('/\[image:/i', $block)) continue;
+        // Nếu ảnh đã là clip nguyên câu/trang từ PDF thì không cần dựng lại.
+        // Còn ảnh/công thức tách ra từ DOCX phải dựng lại thành một ảnh block
+        // để công thức và hình không bị mất hoặc hiển thị quá nhỏ.
+        if (preg_match('~\[image:[^\]]*(?:pdf-question-|pdf-page-)~i', $block)) continue;
         $path = save_question_block_image_from_text($block, $i + 1);
         if ($path) $paths[$i] = $path;
     }
@@ -761,26 +852,160 @@ function save_import_question_block_images(string $text): array {
 }
 
 function convert_docx_to_pdf(string $docxPath): ?string {
+    if (!can_run_external_import_tools()) return null;
     if (!is_file($docxPath)) return null;
     $outDir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'eduquest-docx-' . bin2hex(random_bytes(4));
     if (!is_dir($outDir)) mkdir($outDir, 0777, true);
     $inputPath = $outDir . DIRECTORY_SEPARATOR . 'source.docx';
     copy($docxPath, $inputPath);
     $pdfPath = $outDir . DIRECTORY_SEPARATOR . 'source.pdf';
+    // Profile riêng (KHÔNG dùng profile mặc định để tránh đụng quickstarter làm
+    // soffice crash 0xC0000409). Dùng lại một profile cố định cho lần sau chỉ mất
+    // ~3s thay vì ~17s khởi tạo mới mỗi lần.
+    $profileDir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'eduquest-lo-profile';
+    if (!is_dir($profileDir)) @mkdir($profileDir, 0777, true);
+    $profile = 'file:///' . str_replace('\\', '/', $profileDir);
 
-    $officeCandidates = [
+    // Trên Windows phải dùng soffice.com (console, chạy đồng bộ); soffice.exe là
+    // launcher tách tiến trình nên trả về ngay trước khi tạo xong PDF.
+    $isWindows = stripos(PHP_OS_FAMILY, 'Windows') !== false;
+    $officeCandidates = $isWindows ? [
+        'C:\\Program Files\\LibreOffice\\program\\soffice.com',
+        'C:\\Program Files (x86)\\LibreOffice\\program\\soffice.com',
+        'soffice.com',
+        'soffice.exe',
+    ] : [
         'soffice',
         'libreoffice',
-        'C:\\Program Files\\LibreOffice\\program\\soffice.exe',
-        'C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe',
     ];
     foreach ($officeCandidates as $office) {
-        $cmd = [$office, '--headless', '--convert-to', 'pdf', '--outdir', $outDir, $inputPath];
-        run_command_with_timeout($cmd, 20);
+        $cmd = [$office, '-env:UserInstallation=' . $profile, '--headless', '--norestore', '--convert-to', 'pdf', '--outdir', $outDir, $inputPath];
+        run_command_with_timeout($cmd, 90);
         if (is_file($pdfPath)) return $pdfPath;
     }
 
     return null;
+}
+
+function docx_media_zip_path(string $target): string {
+    $target = str_replace('\\', '/', $target);
+    return str_starts_with($target, '/') ? ltrim($target, '/') : 'word/' . ltrim($target, '/');
+}
+
+function docx_inline_text_from_tokens(array $tokens): string {
+    $out = '';
+    foreach ($tokens as $token) {
+        if (($token['type'] ?? '') === 'image') {
+            $path = trim((string)($token['path'] ?? ''));
+            if ($path !== '') {
+                $out = rtrim($out);
+                $out .= ' [image:' . $path . '] ';
+            }
+            continue;
+        }
+        $out .= (string)($token['text'] ?? '');
+    }
+    return trim(preg_replace('/[ \t]+/u', ' ', $out));
+}
+
+function extract_docx_text_with_inline_media(string $path): string {
+    $zip = new ZipArchive();
+    if ($zip->open($path) !== true) return '';
+    $xml = $zip->getFromName('word/document.xml');
+    $relsXml = $zip->getFromName('word/_rels/document.xml.rels');
+    if (!$xml) {
+        $zip->close();
+        return '';
+    }
+
+    $rels = [];
+    if ($relsXml) {
+        $relsDoc = new DOMDocument();
+        if (@$relsDoc->loadXML($relsXml)) {
+            foreach ($relsDoc->getElementsByTagName('Relationship') as $rel) {
+                if (str_contains((string)$rel->getAttribute('Type'), '/image')) {
+                    $rels[(string)$rel->getAttribute('Id')] = (string)$rel->getAttribute('Target');
+                }
+            }
+        }
+    }
+
+    $doc = new DOMDocument();
+    if (!@$doc->loadXML($xml)) {
+        $zip->close();
+        return trim(html_entity_decode(strip_tags(str_replace('</w:p>', "\n", $xml)), ENT_QUOTES | ENT_XML1, 'UTF-8'));
+    }
+
+    $xp = new DOMXPath($doc);
+    $xp->registerNamespace('w', 'http://schemas.openxmlformats.org/wordprocessingml/2006/main');
+    $xp->registerNamespace('a', 'http://schemas.openxmlformats.org/drawingml/2006/main');
+    $xp->registerNamespace('m', 'http://schemas.openxmlformats.org/officeDocument/2006/math');
+    $xp->registerNamespace('r', 'http://schemas.openxmlformats.org/officeDocument/2006/relationships');
+    $xp->registerNamespace('v', 'urn:schemas-microsoft-com:vml');
+
+    $out = [];
+    foreach ($xp->query('//w:body//w:tbl//w:tr') as $tr) {
+        $cells = [];
+        foreach ($xp->query('./w:tc', $tr) as $tc) {
+            $parts = [];
+            foreach ($xp->query('.//w:t|.//m:t', $tc) as $t) $parts[] = $t->textContent;
+            $cellText = trim(html_entity_decode(implode('', $parts), ENT_QUOTES | ENT_XML1, 'UTF-8'));
+            if ($cellText !== '') $cells[] = $cellText;
+        }
+        if (count($cells) >= 2) $out[] = implode('|', $cells);
+    }
+
+    foreach ($xp->query('//w:body//w:p') as $p) {
+        $tokens = [];
+        foreach ($xp->query('./w:r|./m:oMathPara|./m:oMath', $p) as $node) {
+            if ($node->localName === 'oMath' || $node->localName === 'oMathPara') {
+                $formulaParts = [];
+                foreach ($xp->query('.//m:t', $node) as $t) $formulaParts[] = $t->textContent;
+                $formulaText = trim(html_entity_decode(implode(' ', $formulaParts), ENT_QUOTES | ENT_XML1, 'UTF-8'));
+                if ($formulaText !== '') $tokens[] = ['type' => 'text', 'text' => $formulaText];
+                continue;
+            }
+
+            $runTextParts = [];
+            foreach ($xp->query('.//w:t', $node) as $t) $runTextParts[] = $t->textContent;
+            $runText = html_entity_decode(implode('', $runTextParts), ENT_QUOTES | ENT_XML1, 'UTF-8');
+            if ($runText !== '') $tokens[] = ['type' => 'text', 'text' => $runText];
+
+            // Word thuong nhung cong thuc/OLE duoi CA HAI dang: a:blip (PNG/raster,
+            // trinh duyet doc duoc) va v:imagedata (WMF/EMF vector, phai convert).
+            // Uu tien raster; chi dung vector khi khong co raster de tranh anh
+            // placeholder trung lap tren host khong convert duoc metafile.
+            $savedRids = [];
+            $rasterSaved = false;
+            foreach ($xp->query('.//a:blip', $node) as $blip) {
+                $rid = $blip->getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships', 'embed')
+                    ?: $blip->getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships', 'id');
+                if ($rid === '' || empty($rels[$rid]) || isset($savedRids[$rid])) continue;
+                $image = $zip->getFromName(docx_media_zip_path($rels[$rid]));
+                if ($image === false) continue;
+                $savedRids[$rid] = true;
+                $imagePath = save_question_image_bytes($image, basename($rels[$rid]), docx_inline_text_from_tokens($tokens));
+                if ($imagePath) { $tokens[] = ['type' => 'image', 'path' => $imagePath]; $rasterSaved = true; }
+            }
+            if (!$rasterSaved) {
+                foreach ($xp->query('.//v:imagedata', $node) as $blip) {
+                    $rid = $blip->getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships', 'embed')
+                        ?: $blip->getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships', 'id');
+                    if ($rid === '' || empty($rels[$rid]) || isset($savedRids[$rid])) continue;
+                    $image = $zip->getFromName(docx_media_zip_path($rels[$rid]));
+                    if ($image === false) continue;
+                    $savedRids[$rid] = true;
+                    $imagePath = save_question_image_bytes($image, basename($rels[$rid]), docx_inline_text_from_tokens($tokens));
+                    if ($imagePath) $tokens[] = ['type' => 'image', 'path' => $imagePath];
+                }
+            }
+        }
+        $line = docx_inline_text_from_tokens($tokens);
+        if ($line !== '') $out[] = $line;
+    }
+
+    $zip->close();
+    return trim(implode("\n", $out));
 }
 
 function force_import_questions_as_images(array $questions): array {
@@ -823,7 +1048,7 @@ function attach_pdf_page_images_to_questions(array $questions, array $file, stri
     $alreadyImageQuestions = $questions && count(array_filter($questions, fn($q) => !empty($q['image_path']) && preg_match('/^Cau hoi bang hinh anh/i', (string)($q['content'] ?? '')))) === count($questions);
     if ($alreadyImageQuestions) return $questions;
 
-    $questionImages = render_pdf_question_clips_to_images($tmp, max(120, count($questions) + 5));
+    $questionImages = render_pdf_question_clips_to_images($tmp, max(1000, count($questions) + 5));
     if ($questionImages) {
         if (!$questions) {
             return array_map(fn($path, $i) => image_question_from_path($path, $type, $i + 1), $questionImages, array_keys($questionImages));
@@ -837,7 +1062,7 @@ function attach_pdf_page_images_to_questions(array $questions, array $file, stri
         return $questions;
     }
 
-    $maxPages = max(8, min(30, max(1, count($questions) + 2)));
+    $maxPages = max(500, max(1, count($questions) + 2));
     $pageImages = render_pdf_pages_to_question_images($tmp, $maxPages);
     if (!$pageImages) return $questions;
 
@@ -873,7 +1098,36 @@ function attach_pdf_page_images_to_questions(array $questions, array $file, stri
     unset($question);
     return $questions;
 }
+/**
+ * Chuyen WMF/EMF (va cac dinh dang GD khong doc duoc) sang PNG bang Imagick.
+ * Chay pure-PHP nen dung duoc tren shared host (InfinityFree...) neu ext Imagick
+ * co san. Tra ve true neu tao duoc PNG hop le.
+ */
+function convert_metafile_with_imagick(string $bytes, string $targetPath): bool {
+    if ($bytes === '' || !class_exists('Imagick')) return false;
+    try {
+        $img = new Imagick();
+        $img->setResolution(200, 200);
+        $img->readImageBlob($bytes);
+        $img->setImageFormat('png');
+        $img->setImageBackgroundColor('white');
+        if (method_exists($img, 'mergeImageLayers')) {
+            $img = $img->mergeImageLayers(Imagick::LAYERMETHOD_FLATTEN);
+            $img->setImageFormat('png');
+        }
+        $ok = $img->writeImage($targetPath);
+        $img->clear();
+        $img->destroy();
+    } catch (\Throwable $e) {
+        gemini_last_error('Imagick khong doc duoc metafile: ' . $e->getMessage());
+        return false;
+    }
+    if (!$ok || !is_file($targetPath)) return false;
+    return detect_image_extension((string)file_get_contents($targetPath), 'png') === 'png';
+}
+
 function convert_windows_metafile_to_png(string $sourcePath, string $targetPath): bool {
+    if (!can_run_external_import_tools()) return false;
     if (stripos(PHP_OS_FAMILY, 'Windows') === false) return false;
     $source = str_replace("'", "''", $sourcePath);
     $target = str_replace("'", "''", $targetPath);
@@ -889,6 +1143,32 @@ function convert_windows_metafile_to_png(string $sourcePath, string $targetPath)
 function get_question(int $id): ?array { $st=db()->prepare('SELECT q.*,s.name subject_name,l.name lesson_name FROM questions q JOIN subjects s ON s.id=q.subject_id JOIN lessons l ON l.id=q.lesson_id WHERE q.id=?'); $st->execute([$id]); return $st->fetch() ?: null; }
 function question_options(int $qid): array { $st=db()->prepare('SELECT * FROM question_options WHERE question_id=? ORDER BY label'); $st->execute([$qid]); return $st->fetchAll(); }
 function tf_items(int $qid): array { $st=db()->prepare('SELECT * FROM true_false_items WHERE question_id=? ORDER BY label'); $st->execute([$qid]); return $st->fetchAll(); }
+function tf_answer_value($value): string {
+    $value = strtolower(trim((string)$value));
+    return in_array($value, ['false', 'sai', 's', '0', 'no'], true) ? 'false' : 'true';
+}
+function tf_answer_label($value): string { return tf_answer_value($value) === 'false' ? 'Sai' : 'Đúng'; }
+function tf_item_label($label): string {
+    $label = strtolower(trim((string)$label));
+    return preg_match('/^[a-z]$/', $label) ? $label : 'a';
+}
+function normalize_tf_items_array(array $items, string $difficulty = 'unknown'): array {
+    $out = [];
+    foreach ($items as $key => $item) {
+        if (!is_array($item)) continue;
+        $label = tf_item_label($item['label'] ?? $key);
+        $content = trim((string)($item['content'] ?? $item['text'] ?? ''));
+        if ($content === '') continue;
+        $out[$label] = [
+            'label' => $label,
+            'content' => $content,
+            'answer' => tf_answer_value($item['answer'] ?? 'true'),
+            'difficulty' => $item['difficulty'] ?? $difficulty,
+        ];
+    }
+    ksort($out);
+    return array_values($out);
+}
 
 function ensure_assignments_table(): void {
     db()->exec("CREATE TABLE IF NOT EXISTS exam_assignments (
@@ -1122,9 +1402,30 @@ function question_form_payload(array $src): array {
         $type = $hasOptions ? 'mc' : ($hasTfItems ? 'tf' : 'essay');
     }
     $finalType = in_array($type, ['mc','tf','sa','essay'], true) ? $type : 'mc';
-    $answerValue = in_array($finalType, ['sa', 'essay'], true)
+    $submittedTfItems = [];
+    foreach ((array)($src['tf_items'] ?? []) as $label => $item) {
+        if (is_array($item)) {
+            $submittedTfItems[$label] = $item;
+        }
+    }
+    foreach (['a','b','c','d'] as $l) {
+        $content = trim((string)($src['tf_'.$l] ?? ''));
+        if ($content !== '') {
+            $submittedTfItems[$l] = [
+                'label' => $l,
+                'content' => $content,
+                'answer' => $src['tf_ans_'.$l] ?? 'true',
+                'difficulty' => $src['tf_difficulty_'.$l] ?? ($src['difficulty'] ?? 'unknown'),
+            ];
+        }
+    }
+    $normalizedTfItems = normalize_tf_items_array($submittedTfItems, $src['difficulty'] ?? 'unknown');
+    $rawTfAnswer = $normalizedTfItems[0]['answer'] ?? ($src['tf_answer'] ?? $src['answer'] ?? $src['answer_text'] ?? 'true');
+    $answerValue = $finalType === 'tf'
+        ? tf_answer_value($rawTfAnswer)
+        : (in_array($finalType, ['sa', 'essay'], true)
         ? trim($src['answer_text'] ?? $src['answer'] ?? '')
-        : trim($src['answer'] ?? $src['answer_text'] ?? '');
+        : trim($src['answer'] ?? $src['answer_text'] ?? ''));
     $data = [
         'subject_id' => (int)($src['subject_id'] ?? 0),
         'lesson_id' => ($src['lesson_id'] ?? '') === '__new__' ? 0 : (int)($src['lesson_id'] ?? 0),
@@ -1149,9 +1450,8 @@ function question_form_payload(array $src): array {
         if (!isset($options[$l])) $options[$l] = '';
     }
     $tfItems = [];
-    foreach (['a','b','c','d'] as $l) {
-        $content = trim($src['tf_items'][$l]['content'] ?? $src['tf_'.$l] ?? '');
-        if ($content !== '') $tfItems[] = ['label'=>$l,'content'=>$content,'answer'=>$src['tf_items'][$l]['answer'] ?? $src['tf_ans_'.$l] ?? 'true','difficulty'=>$src['tf_items'][$l]['difficulty'] ?? $data['difficulty']];
+    if ($finalType === 'tf') {
+        $tfItems = $normalizedTfItems ?: [['label'=>'a','content'=>$data['content'],'answer'=>$answerValue,'difficulty'=>$data['difficulty']]];
     }
     return [$data, $options, $tfItems];
 }
@@ -1481,27 +1781,77 @@ function gemini_question_prompt(string $text, string $type, int $count, string $
         . "- Do not rewrite math notation based on your guess.\n"
         . "- If a question contains a diagram/image or unreadable symbols from an image, set has_image=true and needs_review=true.\n"
         . "- When images are attached, set source_image_index to the main 1-based Image number that contains the question. If a question uses multiple attached images/formula fragments, also set source_image_indices to all relevant image numbers.\n"
+        . "- For true/false questions, put the statement in content and put exactly one answer value in answer: true or false. Do not create a,b,c,d true/false sub-items.\n"
         . "- Return valid JSON only, no markdown fences and no explanation outside JSON.\n"
-        . "JSON schema: {\"questions\":[{\"type\":\"mc|tf|sa|essay\",\"question_text\":\"\",\"content\":\"\",\"has_image\":false,\"source_image_index\":1,\"source_image_indices\":[1],\"image_note\":\"\",\"options\":[{\"label\":\"A\",\"text\":\"\"},{\"label\":\"B\",\"text\":\"\"},{\"label\":\"C\",\"text\":\"\"},{\"label\":\"D\",\"text\":\"\"}],\"tf_items\":[{\"label\":\"a\",\"content\":\"\",\"answer\":\"true\"}],\"correct_answer\":\"\",\"answer\":\"\",\"difficulty\":\"easy|medium|hard|unknown\",\"explanation\":\"\",\"needs_review\":false}]}.\n"
+        . "JSON schema: {\"questions\":[{\"type\":\"mc|tf|sa|essay\",\"question_text\":\"\",\"content\":\"\",\"has_image\":false,\"source_image_index\":1,\"source_image_indices\":[1],\"image_note\":\"\",\"options\":[{\"label\":\"A\",\"text\":\"\"},{\"label\":\"B\",\"text\":\"\"},{\"label\":\"C\",\"text\":\"\"},{\"label\":\"D\",\"text\":\"\"}],\"correct_answer\":\"\",\"answer\":\"A|true|false|short answer\",\"difficulty\":\"easy|medium|hard|unknown\",\"explanation\":\"\",\"needs_review\":false}]}.\n"
         . "Context text, if any:\n" . mb_substr($text, 0, 12000);
+}
+
+/**
+ * Luu/lay loi Gemini gan nhat de hien thi ro rang thay vi that bai im lang.
+ * Goi gemini_last_error() (khong tham so) de doc.
+ */
+function gemini_last_error(?string $set = null): string {
+    static $last = '';
+    if ($set !== null) $last = $set;
+    return $last;
 }
 
 function gemini_api_generate(array $parts, string $key): ?array {
     $model = rawurlencode(gemini_model());
+    $url = "https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent";
     $payload = json_encode(['contents' => [['parts' => $parts]]], JSON_UNESCAPED_UNICODE);
-    $ch = curl_init("https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent");
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_POST => true,
-        CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'x-goog-api-key: ' . $key],
-        CURLOPT_POSTFIELDS => $payload,
-        CURLOPT_TIMEOUT => 75,
-    ]);
-    $raw = curl_exec($ch);
-    $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-    if (!$raw || $status < 200 || $status >= 300) return null;
-    return json_decode($raw, true) ?: null;
+    gemini_last_error('');
+
+    // Uu tien cURL. Neu host chan/khong co cURL thi thu file_get_contents (allow_url_fopen).
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST => true,
+            CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'x-goog-api-key: ' . $key],
+            CURLOPT_POSTFIELDS => $payload,
+            CURLOPT_TIMEOUT => 75,
+            CURLOPT_CONNECTTIMEOUT => 15,
+        ]);
+        $raw = curl_exec($ch);
+        $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlErr = curl_error($ch);
+        curl_close($ch);
+        if ($raw !== false && $status >= 200 && $status < 300) {
+            return json_decode($raw, true) ?: null;
+        }
+        if ($raw === false || $status === 0) {
+            gemini_last_error('cURL khong ket noi duoc toi Google (co the host chan outbound): ' . ($curlErr ?: 'connection failed'));
+        } else {
+            gemini_last_error('Gemini tra ve HTTP ' . $status . ': ' . mb_substr((string)$raw, 0, 300));
+            // Loi HTTP that su (vd 400/403 sai key) thi khong can thu fopen nua.
+            return null;
+        }
+    } else {
+        gemini_last_error('PHP khong co extension cURL tren host nay.');
+    }
+
+    // Fallback: file_get_contents qua HTTPS (neu allow_url_fopen bat).
+    if (function_exists('ini_get') && filter_var(ini_get('allow_url_fopen'), FILTER_VALIDATE_BOOLEAN)) {
+        $ctx = stream_context_create(['http' => [
+            'method' => 'POST',
+            'header' => "Content-Type: application/json\r\nx-goog-api-key: {$key}\r\n",
+            'content' => $payload,
+            'timeout' => 75,
+            'ignore_errors' => true,
+        ], 'ssl' => ['verify_peer' => true, 'verify_peer_name' => true]]);
+        $raw = @file_get_contents($url, false, $ctx);
+        if ($raw !== false && $raw !== '') {
+            $decoded = json_decode($raw, true);
+            if (isset($decoded['candidates'])) return $decoded;
+            gemini_last_error('file_get_contents nhan phan hoi khong hop le: ' . mb_substr((string)$raw, 0, 300));
+        } else {
+            gemini_last_error(gemini_last_error() ?: 'file_get_contents khong ket noi duoc toi Google (host chan outbound).');
+        }
+    }
+
+    return null;
 }
 
 function gemini_decode_questions_response(?array $json, string $type): array {
@@ -1621,6 +1971,32 @@ function gemini_generate_questions_from_images(array $imagePaths, string $type, 
         }
     }
     return array_slice($out, 0, max(1, $count));
+}
+
+function gemini_generate_questions_from_pdf_upload(array $file, string $type, int $count, string $difficulty = 'medium', string $contextText = ''): array {
+    $type = normalize_generation_type($type);
+    $key = gemini_api_key();
+    if (!$key || !function_exists('curl_init')) return [];
+    if (($file['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) return [];
+    if (strtolower(pathinfo($file['name'] ?? '', PATHINFO_EXTENSION)) !== 'pdf') return [];
+    $tmp = (string)($file['tmp_name'] ?? '');
+    if ($tmp === '' || !is_file($tmp)) return [];
+    $bytes = (string)file_get_contents($tmp);
+    if ($bytes === '') return [];
+
+    $parts = [
+        ['text' => gemini_question_prompt($contextText, $type, max(1, $count), $difficulty)
+            . "\nThe attached file is the original PDF. OCR all visible text, math formulas, answer choices, true/false statements, and diagrams carefully. If a diagram/formula cannot be converted exactly, set use_image=true."],
+        ['inline_data' => ['mime_type' => 'application/pdf', 'data' => base64_encode($bytes)]],
+    ];
+    $questions = gemini_decode_questions_response(gemini_api_generate($parts, $key), $type);
+    foreach ($questions as &$question) {
+        if (!empty($question['use_image']) || !empty($question['needs_review'])) {
+            $question['needs_review'] = 1;
+        }
+    }
+    unset($question);
+    return $questions;
 }
 
 function normalize_ai_questions(array $items, string $type): array {
@@ -1750,6 +2126,68 @@ function collect_preview_questions(array $rows, int $subjectId, int $lessonId, s
     return $saved;
 }
 
+function subject_question_corpus(int $subjectId, int $limit = 300): string {
+    if ($subjectId <= 0) return '';
+    $limit = max(1, min(1000, $limit));
+    $st = db()->prepare("SELECT q.*, l.name lesson_name, e.code exam_code, e.title exam_title, eq.position
+        FROM questions q
+        JOIN lessons l ON l.id=q.lesson_id
+        LEFT JOIN exam_questions eq ON eq.question_id=q.id
+        LEFT JOIN exams e ON e.id=eq.exam_id
+        WHERE q.subject_id=?
+        ORDER BY COALESCE(e.created_at, q.created_at) DESC, e.id DESC, eq.position ASC, q.created_at DESC
+        LIMIT {$limit}");
+    $st->execute([$subjectId]);
+    $rows = $st->fetchAll();
+    if (!$rows) return '';
+
+    $out = [];
+    foreach ($rows as $i => $q) {
+        $out[] = '--- Cau tham khao ' . ($i + 1) . ' ---';
+        if (!empty($q['exam_code']) || !empty($q['exam_title'])) {
+            $out[] = 'De: ' . trim((string)($q['exam_code'] ?? '') . ' ' . (string)($q['exam_title'] ?? ''));
+        }
+        $out[] = 'Bai: ' . (string)($q['lesson_name'] ?? '');
+        $out[] = 'Dang: ' . type_label((string)$q['type']) . '; Do kho: ' . difficulty_label((string)$q['difficulty']);
+        $out[] = 'Noi dung: ' . trim((string)$q['content']);
+        if (($q['type'] ?? '') === 'mc') {
+            foreach (question_options((int)$q['id']) as $op) {
+                $out[] = (string)$op['label'] . '. ' . trim((string)$op['content']);
+            }
+            $out[] = 'Dap an: ' . trim((string)($q['answer'] ?? ''));
+        } elseif (($q['type'] ?? '') === 'tf') {
+            $items = tf_items((int)$q['id']);
+            if ($items) {
+                foreach ($items as $it) {
+                    $out[] = (string)$it['label'] . '. ' . trim((string)$it['content']) . ' => ' . tf_answer_label($it['answer']);
+                }
+            } else {
+                $out[] = 'Dap an: ' . tf_answer_label($q['answer'] ?? 'true');
+            }
+        } elseif (trim((string)($q['answer'] ?? '')) !== '') {
+            $out[] = 'Dap an goi y: ' . trim((string)$q['answer']);
+        }
+        if (trim((string)($q['explanation'] ?? '')) !== '') $out[] = 'Giai thich: ' . trim((string)$q['explanation']);
+    }
+    return trim(implode("\n", $out));
+}
+
+function gemini_generate_similar_questions(string $text, string $type, int $count, string $difficulty = 'medium'): array {
+    $type = normalize_generation_type($type);
+    $typeInstruction = $type === 'mixed' ? 'a reasonable mix of mc, tf, sa, and essay' : $type;
+    $key = gemini_api_key();
+    if (!$key || !function_exists('curl_init')) return auto_generate_questions($text, $type, $count);
+    $prompt = "You generate NEW Vietnamese exam questions from an existing subject question bank.\n"
+        . "Create exactly {$count} new questions of type {$typeInstruction}, difficulty {$difficulty}.\n"
+        . "Use the existing questions only as style, topic, scope, notation, and difficulty references.\n"
+        . "Do not copy any question, option, or answer verbatim. Change numbers, contexts, and wording while preserving curriculum relevance.\n"
+        . "For multiple choice, provide options A,B,C,D and answer as one letter. For true/false, use one statement in content and answer true/false. For short answer and essay, provide a suggested answer/rubric.\n"
+        . "Return valid JSON only, no markdown fences. JSON schema: {\"questions\":[{\"type\":\"mc|tf|sa|essay\",\"content\":\"\",\"options\":{\"A\":\"\",\"B\":\"\",\"C\":\"\",\"D\":\"\"},\"answer\":\"A|true|false|short answer\",\"difficulty\":\"easy|medium|hard|unknown\",\"explanation\":\"\"}]}.\n"
+        . "Existing subject data:\n" . mb_substr($text, 0, 20000);
+    $questions = gemini_decode_questions_response(gemini_api_generate([['text' => $prompt]], $key), $type);
+    return $questions ?: auto_generate_questions($text, $type, $count);
+}
+
 function detect_difficulty(string $line): string { $n = preg_match_all('/\*/', $line); return $n === 1 ? 'easy' : ($n === 2 ? 'medium' : ($n >= 3 ? 'hard' : 'unknown')); }
 function clean_stars(string $line): string { return trim(preg_replace('/\s*\*{1,3}\s*$/', '', $line)); }
 
@@ -1765,6 +2203,7 @@ function import_match_text(string $text): string {
 
 function is_import_question_line(string $line): bool {
     $line = trim($line);
+    $line = preg_replace('/^(?:\[image:\s*.+?\s*\]\s*)+/iu', '', $line);
     if (preg_match('/^(?:cau|câu|question|q)\s*\d{1,4}\s*[\.\:\)\-]/iu', $line)) return true;
     if (preg_match('/^\d{1,4}\s*[\.\)]\s+\S/u', $line)) return true;
     return false;
@@ -1772,8 +2211,14 @@ function is_import_question_line(string $line): bool {
 
 function strip_import_question_prefix(string $line): string {
     $line = trim($line);
+    $leadingImages = '';
+    if (preg_match('/^((?:\[image:\s*.+?\s*\]\s*)+)/iu', $line, $m)) {
+        $leadingImages = trim($m[1]);
+        $line = trim(substr($line, strlen($m[0])));
+    }
     $line = preg_replace('/^(?:cau|câu|question|q)\s*\d{1,4}\s*[\.\:\)\-]\s*/iu', '', $line);
     $line = preg_replace('/^\d{1,4}\s*[\.\)]\s*/u', '', (string)$line);
+    if ($leadingImages !== '') $line = $leadingImages . ' ' . trim((string)$line);
     return trim((string)$line);
 }
 
@@ -1799,7 +2244,7 @@ function parse_import_tf_line(string $line): ?array {
     return [strtolower($m[1]), clean_stars($m[2])];
 }
 
-function tf_answer_value(string $text): string {
+function import_tf_answer_value(string $text): string {
     $text = import_match_text($text);
     return preg_match('/^(d|dung|true|1|yes)\b/u', $text) ? 'true' : 'false';
 }
@@ -1809,7 +2254,7 @@ function apply_tf_answer_map(array &$question, string $answerText): void {
     foreach (preg_split('/[,;]+/', $answerText, -1, PREG_SPLIT_NO_EMPTY) as $part) {
         if (!preg_match('/^\s*([a-d])\s*[\.\-\:\)]\s*(.+?)\s*$/iu', trim($part), $m)) continue;
         $label = strtolower($m[1]);
-        if (isset($question['tf_items'][$label])) $question['tf_items'][$label]['answer'] = tf_answer_value($m[2]);
+        if (isset($question['tf_items'][$label])) $question['tf_items'][$label]['answer'] = import_tf_answer_value($m[2]);
     }
 }
 
@@ -2193,7 +2638,8 @@ function finalize_import_preview_questions(array $questions, string $sourceText 
         $question['type'] = in_array(($question['type'] ?? ''), question_types(), true) ? $question['type'] : 'essay';
         $question['content'] = trim((string)($question['content'] ?? ''));
         $question['image_path'] = implode('|', normalize_question_image_paths((string)($question['image_path'] ?? ''), $question['content']));
-        $question['difficulty'] = in_array(($question['difficulty'] ?? 'unknown'), ['easy','medium','hard','unknown'], true) ? $question['difficulty'] : 'unknown';
+        $rawDifficulty = $question['difficulty'] ?? 'unknown';
+        $question['difficulty'] = in_array($rawDifficulty, ['easy','medium','hard','unknown'], true) ? $rawDifficulty : 'unknown';
         $question['answer'] = trim((string)($question['answer'] ?? ''));
         $question['explanation'] = trim((string)($question['explanation'] ?? ''));
         $question['options'] = is_array($question['options'] ?? null) ? $question['options'] : [];
@@ -2202,10 +2648,26 @@ function finalize_import_preview_questions(array $questions, string $sourceText 
         apply_inline_question_parts($question);
         if (($question['type'] ?? '') === 'essay' && !empty(array_filter($question['options'], fn($v) => trim((string)$v) !== ''))) $question['type'] = 'mc';
         if (($question['type'] ?? '') === 'essay' && !empty($question['tf_items'])) $question['type'] = 'tf';
+        // Câu tự luận nhưng kèm đáp án ngắn gọn (1 từ/cụm ngắn, không có ảnh inline)
+        // -> coi là "trả lời ngắn" (sa) để chấm tự động theo đáp án.
+        if (($question['type'] ?? '') === 'essay') {
+            $ans = trim((string)($question['answer'] ?? ''));
+            $wordCount = $ans === '' ? 0 : count(preg_split('/\s+/u', $ans));
+            if ($ans !== '' && mb_strlen($ans) <= 40 && $wordCount <= 6
+                && strpos($ans, "\n") === false && !question_content_has_inline_images($ans)) {
+                $question['type'] = 'sa';
+            }
+        }
 
         if ($question['type'] === 'mc') {
             foreach (mc_option_labels($question['options'], $question['answer']) as $label) {
-                $question['options'][$label] = trim((string)($question['options'][$label] ?? $question['options'][strtolower($label)] ?? ''));
+                $val = trim((string)($question['options'][$label] ?? $question['options'][strtolower($label)] ?? ''));
+                // Đáp án là ảnh công thức (WMF) thì chỉ còn lại dấu câu vụn ("." hoặc
+                // lẫn nhãn phương án khác như ". C. . D. .") -> để trống cho gọn,
+                // giáo viên nhìn ảnh câu hỏi để biết phương án.
+                $probe = preg_replace('/[A-Z]\s*[.\):]/u', '', $val);
+                if (preg_match('/^[\s.,;:·•\-–—]*$/u', (string)$probe)) $val = '';
+                $question['options'][$label] = $val;
             }
             if (preg_match('/[A-Z]/i', $question['answer'], $m)) $question['answer'] = strtoupper($m[0]);
             if (!preg_match('/^[A-Z]$/', $question['answer'])) $question['answer'] = 'A';
@@ -2213,6 +2675,19 @@ function finalize_import_preview_questions(array $questions, string $sourceText 
 
         if ($question['type'] === 'tf') {
             apply_tf_answer_map($question, $question['answer']);
+            $question['tf_items'] = normalize_tf_items_array($question['tf_items'], $question['difficulty']);
+            $tfAnswer = strtolower(trim($question['answer']));
+            if (in_array($tfAnswer, ['false', 'sai', 's', '0', 'no'], true)) {
+                $question['answer'] = 'false';
+            } elseif (in_array($tfAnswer, ['true', 'dung', 'đúng', 'd', '1', 'yes'], true)) {
+                $question['answer'] = 'true';
+            } else {
+                $firstTf = $question['tf_items'] ? reset($question['tf_items']) : [];
+                $question['answer'] = (($firstTf['answer'] ?? 'true') === 'false') ? 'false' : 'true';
+            }
+            if (!$question['tf_items'] && $question['content'] !== '') {
+                $question['tf_items'] = [['label'=>'a','content'=>$question['content'],'answer'=>$question['answer'],'difficulty'=>$question['difficulty']]];
+            }
         }
 
         if ($question['content'] === '' && $question['image_path'] !== '') $question['content'] = 'Cau hoi bang hinh anh ' . ($i + 1);
@@ -2234,12 +2709,18 @@ function preserve_import_source_images(array $questions, string $sourceText = ''
 
     $allImages = import_image_paths_from_text($sourceText);
     if ($allImages) {
+        $assignedImages = [];
+        foreach ($questions as $question) {
+            foreach (normalize_question_image_paths((string)($question['image_path'] ?? ''), (string)($question['content'] ?? '')) as $path) {
+                $assignedImages[$path] = true;
+            }
+        }
         foreach ($questions as $i => &$question) {
             $paths = normalize_question_image_paths((string)($question['image_path'] ?? ''), (string)($question['content'] ?? ''));
-            if (!$paths && isset($allImages[$i])) {
+            if (!$paths && isset($allImages[$i]) && empty($assignedImages[$allImages[$i]])) {
                 $paths[] = $allImages[$i];
             } elseif (!$paths && count($questions) === 1) {
-                $paths = $allImages;
+                $paths = array_values(array_filter($allImages, fn($path) => empty($assignedImages[$path])));
             }
             $question['image_path'] = implode('|', array_values(array_unique(array_filter($paths))));
             if ($question['image_path'] !== '') $question['needs_review'] = (int)($question['needs_review'] ?? 1);
@@ -2271,14 +2752,28 @@ function extract_upload_text(array $file): string {
         return $text;
     }
     if ($ext === 'docx') {
+        // Với file Word có công thức/hình, cách ổn định nhất là chuyển DOCX -> PDF
+        // rồi cắt ảnh từng câu. Như vậy giữ nguyên layout, công thức OMML/WMF/EMF,
+        // hình vẽ, bảng... thay vì chỉ lấy text và làm mất ký hiệu.
+        $docxText = extract_docx_text_with_inline_media($file['tmp_name']);
         $pdfPath = convert_docx_to_pdf($file['tmp_name']);
         if ($pdfPath) {
-            $text = extract_pdf_text($pdfPath);
+            $pdfText = extract_pdf_text($pdfPath);
+            $text = trim($pdfText) !== '' ? $pdfText : $docxText;
             $questionImages = render_pdf_question_clips_to_images($pdfPath);
             if ($questionImages) return merge_question_blocks_with_images($text, $questionImages);
             $pageImages = render_pdf_pages_to_question_images($pdfPath);
-            if ($pageImages) return image_question_text_from_paths($pageImages);
+            if ($pageImages) {
+                if ($text !== '' && preg_match('/^\s*(?:(?:Cau|Câu|Question|Q)\s*\d{1,4}|\d{1,4})\s*[\.\:\)\-]/miu', $text)) {
+                    return merge_question_blocks_with_images($text, $pageImages);
+                }
+                return image_question_text_from_paths($pageImages);
+            }
         }
+
+        // Fallback cho hosting không chạy được LibreOffice/Python: đọc XML trong DOCX
+        // và giữ marker [image:...] để hệ thống vẫn có thể render ảnh được.
+        if ($docxText !== '') return $docxText;
 
         $zip = new ZipArchive();
         if ($zip->open($file['tmp_name']) === true) {
@@ -2368,11 +2863,10 @@ function extract_upload_text(array $file): string {
                 if ($hasInlineMedia && $tokens) {
                     $inlinePath = save_question_inline_tokens_image($tokens, (int)$pIndex + 1);
                     if ($inlinePath) {
-                        if (is_import_question_line($line)) {
-                            $out[] = preg_replace('/' . preg_quote(strip_import_question_prefix($line), '/') . '$/u', '', $line) ?: $line;
-                        } elseif ($line !== '') {
-                            $out[] = $line;
-                        }
+                        // Giữ nguyên text của đoạn (gồm cả text công thức đã trích từ m:t)
+                        // để câu hỏi/đáp án vẫn nhận đúng vị trí; ảnh công thức được đính
+                        // ngay sau đó nên gắn vào đúng câu này.
+                        if ($line !== '') $out[] = $line;
                         $out[] = '[image:' . $inlinePath . ']';
                         continue;
                     }
@@ -2389,10 +2883,12 @@ function extract_upload_text(array $file): string {
 
 function extract_pdf_text(string $path): string {
     if (!is_file($path)) return '';
-    $text = extract_pdf_text_with_pdftotext($path);
-    if ($text !== '') return $text;
-    $text = extract_pdf_text_with_python($path);
-    if ($text !== '') return $text;
+    if (can_run_external_import_tools()) {
+        $text = extract_pdf_text_with_pdftotext($path);
+        if ($text !== '') return $text;
+        $text = extract_pdf_text_with_python($path);
+        if ($text !== '') return $text;
+    }
     return extract_pdf_text_native($path);
 }
 
@@ -2403,7 +2899,7 @@ function extract_pdf_text_with_pdftotext(string $path): string {
 }
 
 function extract_pdf_text_with_python(string $path): string {
-    $script = 'import sys, importlib.util; p=sys.argv[1]; text="";'
+    $script = 'import sys, importlib.util; sys.stdout.reconfigure(encoding="utf-8"); p=sys.argv[1]; text="";'
         . "\nif importlib.util.find_spec('fitz'):\n import fitz\n d=fitz.open(p)\n text='\\n'.join(page.get_text() for page in d)"
         . "\nelif importlib.util.find_spec('pypdf'):\n from pypdf import PdfReader\n r=PdfReader(p)\n text='\\n'.join((page.extract_text() or '') for page in r.pages)"
         . "\nprint(text)";
@@ -2498,7 +2994,7 @@ function auto_generate_questions(string $text, string $type, int $count): array 
         $s = trim($sentences[$i]);
         $qType = $type === 'mixed' ? $types[$i % count($types)] : $type;
         if ($qType === 'mc') $result[] = ['type'=>'mc','content'=>'Theo tài liệu, nội dung nào sau đây là đúng: ' . $s, 'difficulty'=>'medium','answer'=>'A','options'=>['A'=>$s,'B'=>'Một nhận định không phù hợp với tài liệu','C'=>'Một nội dung không được đề cập','D'=>'Tất cả các đáp án trên đều sai']];
-        elseif ($qType === 'tf') $result[] = ['type'=>'tf','content'=>'Đánh giá nhận định sau dựa trên tài liệu.', 'difficulty'=>'medium','answer'=>'a-Đúng','tf_items'=>['a'=>['label'=>'a','content'=>$s,'answer'=>'true','difficulty'=>'medium'],'b'=>['label'=>'b','content'=>'Nội dung trên không xuất hiện trong tài liệu.','answer'=>'false','difficulty'=>'easy']]];
+        elseif ($qType === 'tf') $result[] = ['type'=>'tf','content'=>$s, 'difficulty'=>'medium','answer'=>'true','tf_items'=>[]];
         elseif ($qType === 'sa') $result[] = ['type'=>'sa','content'=>'Trình bày ngắn gọn ý chính của đoạn: ' . $s, 'difficulty'=>'medium','answer'=>$s];
         else $result[] = ['type'=>'essay','content'=>'Phân tích và mở rộng ý sau dựa trên tài liệu: ' . $s, 'difficulty'=>'hard','answer'=>'Học sinh trình bày đúng trọng tâm, có dẫn chứng và lập luận rõ ràng.'];
     }

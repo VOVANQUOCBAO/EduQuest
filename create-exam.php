@@ -214,6 +214,10 @@ include __DIR__ . '/includes/header.php';
 
     <h3>Chọn số câu theo bài học</h3>
     <p class="muted">Số nhỏ trong mỗi ô là số câu hiện có trong database. Chọn “Tổng hợp” nếu muốn một đề có nhiều dạng như trắc nghiệm, đúng/sai và tự luận.</p>
+    <div class="actions" style="margin-bottom:12px">
+      <button class="btn ghost" type="button" data-fill-all-questions><span class="material-symbols-outlined">select_all</span> Chọn tất cả câu hiện có</button>
+      <button class="btn ghost" type="button" data-clear-all-questions><span class="material-symbols-outlined">backspace</span> Bỏ chọn</button>
+    </div>
     <div class="table-scroll">
       <table class="table exam-builder-table" data-exam-builder-table>
         <tr>

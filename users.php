@@ -138,11 +138,13 @@ $tree = school_tree();
 $schools = db()->query('SELECT * FROM schools ORDER BY name')->fetchAll();
 $grades = db()->query('SELECT g.*,s.name school_name FROM school_grades g JOIN schools s ON s.id=g.school_id ORDER BY s.name,g.name')->fetchAll();
 $classes = db()->query('SELECT c.*,g.name grade_name,s.name school_name FROM school_classes c JOIN school_grades g ON g.id=c.grade_id JOIN schools s ON s.id=g.school_id ORDER BY s.name,g.name,c.name')->fetchAll();
+$userWhere = $isAdmin ? '' : ' WHERE u.role <> "admin"';
 $users = db()->query('SELECT u.*,c.name class_name,g.name grade_name,s.name school_name
     FROM users u
     LEFT JOIN school_classes c ON c.id=u.class_id
     LEFT JOIN school_grades g ON g.id=c.grade_id
     LEFT JOIN schools s ON s.id=g.school_id
+    ' . $userWhere . '
     ORDER BY u.created_at DESC')->fetchAll();
 
 include __DIR__ . '/includes/header.php';

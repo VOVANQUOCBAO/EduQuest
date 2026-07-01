@@ -42,30 +42,67 @@ function renumberPreviewQuestions(form) {
   });
 }
 
-function resetPreviewQuestion(card) {
-  card.querySelectorAll('[data-option-list]').forEach(list => {
-    list.querySelectorAll('[data-option-label]').forEach(row => {
-      if (!['A', 'B', 'C', 'D'].includes((row.dataset.optionLabel || '').toUpperCase())) row.remove();
-    });
-  });
-  card.querySelectorAll('textarea').forEach(field => { field.value = ''; });
-  card.querySelectorAll('input').forEach(field => {
-    if (field.type === 'checkbox') field.checked = false;
-    else if (field.type === 'hidden') field.value = '';
-    else field.value = '';
-  });
-  card.querySelectorAll('select').forEach(select => {
-    if (select.name.includes('[type]')) select.value = 'mixed';
-    else if (select.name.includes('[difficulty]')) select.value = 'unknown';
-    else if (select.name.includes('[answer]')) {
-      Array.from(select.options).forEach(option => {
-        if (!['A', 'B', 'C', 'D'].includes(option.value)) option.remove();
-      });
-      select.value = select.name.includes('[tf_items]') ? 'true' : 'A';
-    }
-  });
-  card.querySelectorAll('.question-image').forEach(image => image.remove());
-  card.querySelectorAll('[data-question-type]').forEach(refreshQuestionEditor);
+function previewQuestionTemplate(index) {
+  const mcOptions = ['A', 'B', 'C', 'D'].map(label => `
+          <div class="option-row" data-option-label="${label}">
+            <label>Đáp án ${label}</label>
+            <input name="q[${index}][options][${label}]" value="">
+          </div>`).join('');
+  const mcAnswerOptions = ['A', 'B', 'C', 'D'].map(label => `<option value="${label}">${label}</option>`).join('');
+  const tfRows = ['a', 'b', 'c', 'd'].map(label => `
+          <div class="option-row">
+            <label>${label}</label>
+            <input name="q[${index}][tf_items][${label}][content]" value="">
+            <select name="q[${index}][tf_items][${label}][answer]">
+              <option value="true">Đúng</option>
+              <option value="false">Sai</option>
+            </select>
+          </div>`).join('');
+  return `
+    <div class="question-edit-card">
+      <div class="question-edit-head">
+        <strong>Câu ${index + 1}</strong>
+        <select name="q[${index}][type]" data-question-type>
+          <option value="mixed">Tổng hợp</option>
+          <option value="mc" selected>Trắc nghiệm</option>
+          <option value="tf">Đúng/Sai</option>
+          <option value="sa">Trả lời ngắn</option>
+          <option value="essay">Tự luận</option>
+        </select>
+        <select name="q[${index}][difficulty]">
+          <option value="easy">Nhận biết</option>
+          <option value="medium" selected>Thông hiểu</option>
+          <option value="hard">Vận dụng</option>
+          <option value="unknown">Không rõ</option>
+        </select>
+        <button class="btn danger" type="button" data-remove-preview-question><span class="material-symbols-outlined">delete</span> Xóa câu</button>
+      </div>
+      <input type="hidden" name="q[${index}][image_path]" value="">
+      <div class="question-content-field">
+        <label>Nội dung</label>
+        <textarea name="q[${index}][content]"></textarea>
+      </div>
+      <div class="grid grid-2 question-type-panel" data-panel="mc">
+        <div data-option-list data-option-name-template="q[${index}][options][__LABEL__]" data-answer-select="select[name='q[${index}][answer]']">
+          ${mcOptions}
+        </div>
+        <button class="btn ghost" type="button" data-add-option><span class="material-symbols-outlined">add_circle</span> Thêm đáp án</button>
+      </div>
+      <div class="question-type-panel" data-panel="tf">
+        <label>Đáp án Đúng/Sai</label>
+        ${tfRows}
+      </div>
+      <div class="question-type-panel" data-panel="mc-answer">
+        <label>Đáp án đúng</label>
+        <select name="q[${index}][answer]">${mcAnswerOptions}</select>
+      </div>
+      <div class="question-type-panel" data-panel="text">
+        <label>Đáp án gợi ý / đáp án ngắn</label>
+        <input name="q[${index}][answer_text]" value="" placeholder="Đáp án tự luận hoặc trả lời ngắn">
+      </div>
+      <label>Giải thích</label>
+      <textarea name="q[${index}][explanation]"></textarea>
+    </div>`;
 }
 
 function nextOptionLabel(list) {
@@ -114,14 +151,31 @@ document.querySelectorAll('[data-add-preview-question]').forEach(button => {
   button.addEventListener('click', () => {
     const form = button.closest('form');
     const cards = form ? form.querySelectorAll('.question-edit-card') : [];
-    const last = cards[cards.length - 1];
-    if (!form || !last) return;
-    const clone = last.cloneNode(true);
-    resetPreviewQuestion(clone);
-    last.after(clone);
+    if (!form) return;
+    const wrap = document.createElement('div');
+    wrap.innerHTML = previewQuestionTemplate(cards.length).trim();
+    const card = wrap.firstElementChild;
+    const saveButton = form.querySelector('button[name="save_preview"]');
+    if (saveButton) saveButton.before(card);
+    else form.appendChild(card);
     renumberPreviewQuestions(form);
-    clone.querySelector('textarea, input:not([type="hidden"]), select')?.focus();
+    card.querySelectorAll('[data-question-type]').forEach(select => {
+      refreshQuestionEditor(select);
+      select.addEventListener('change', () => refreshQuestionEditor(select));
+    });
+    card.querySelector('textarea[name$="[content]"]')?.focus();
   });
+});
+
+document.addEventListener('click', e => {
+  const button = e.target.closest('[data-remove-preview-question]');
+  if (!button) return;
+  e.preventDefault();
+  const card = button.closest('.question-edit-card');
+  const form = button.closest('form');
+  if (!card || !form) return;
+  card.remove();
+  renumberPreviewQuestions(form);
 });
 
 document.querySelectorAll('select[data-lesson-filter]').forEach(lessonSelect => {
@@ -192,6 +246,22 @@ function refreshExamMode(select) {
 document.querySelectorAll('[data-exam-mode]').forEach(select => {
   refreshExamMode(select);
   select.addEventListener('change', () => refreshExamMode(select));
+});
+
+document.querySelectorAll('[data-fill-all-questions]').forEach(button => {
+  button.addEventListener('click', () => {
+    document.querySelectorAll('[data-exam-builder-table] input[type="number"]').forEach(input => {
+      if (!input.disabled) input.value = input.max || '0';
+    });
+  });
+});
+
+document.querySelectorAll('[data-clear-all-questions]').forEach(button => {
+  button.addEventListener('click', () => {
+    document.querySelectorAll('[data-exam-builder-table] input[type="number"]').forEach(input => {
+      input.value = '0';
+    });
+  });
 });
 
 document.querySelectorAll('[data-chart-tabs]').forEach(tabGroup => {

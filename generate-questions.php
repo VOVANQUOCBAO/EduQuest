@@ -1,14 +1,18 @@
 <?php
 require_once __DIR__ . '/includes/functions.php';
 require_role(['admin', 'teacher']);
-$page_title = 'Tạo câu hỏi từ tài liệu';
+ensure_question_image_column();
+$page_title = 'Tạo câu hỏi bằng AI';
 
 $generated = [];
-$subject = (int)post('subject_id', 0);
+$subject = (int)post('subject_id', (int)($_GET['subject_id'] ?? 0));
 $lesson = (int)post('lesson_id', 0);
 $lessonName = post('lesson_name', '');
 $type = normalize_generation_type(post('type', 'mixed'));
 $difficulty = post('difficulty', 'medium');
+$count = max(1, min(200, (int)post('count', 5)));
+$sourceText = post('source_text', '');
+$sourceMode = post('source_mode', 'subject');
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $subject = (int)post('subject_id');
@@ -16,27 +20,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $lessonName = post('lesson_name', '');
     $type = normalize_generation_type(post('type', 'mixed'));
     $difficulty = post('difficulty', 'medium');
+    $count = max(1, min(200, (int)post('count', 5)));
+    $sourceText = post('source_text', '');
+    $sourceMode = in_array(post('source_mode', 'subject'), ['subject', 'manual'], true) ? post('source_mode', 'subject') : 'subject';
 
     if (isset($_POST['save_preview'])) {
         $saved = collect_preview_questions($_POST['q'] ?? [], $subject, $lesson, $lessonName);
-        flash('Đã tạo và lưu ' . $saved . ' câu hỏi');
+        flash('Đã lưu ' . $saved . ' câu hỏi vào ngân hàng');
         redirect('questions.php?subject_id=' . $subject);
     }
 
-    $text = extract_upload_text($_FILES['file'] ?? []);
-    $rawText = post('raw_text');
-    if (!$text) $text = $rawText;
-    if (!$text) {
-        flash('Vui lòng upload file hoặc dán nội dung tài liệu.', 'error');
-        redirect('generate-questions.php');
+    $sourceForAi = $sourceMode === 'subject' ? subject_question_corpus($subject) : trim($sourceText);
+    if ($sourceMode === 'subject' && trim($sourceText) !== '') {
+        $sourceForAi .= "\n\nYeu cau rieng cua giao vien:\n" . trim($sourceText);
     }
-    $blockImages = save_import_question_block_images($text);
-    $imagePaths = $blockImages ? array_values($blockImages) : import_image_paths_from_text($text);
-    $generated = $imagePaths
-        ? gemini_generate_questions_from_images($imagePaths, $type, max(1, (int)post('count', 5)), $difficulty, trim($rawText . "\n" . $text))
-        : gemini_generate_questions($text, $type, max(1, (int)post('count', 5)), $difficulty);
-    $generated = attach_image_groups_to_questions($generated, $text);
-    $generated = attach_block_images_to_questions($generated, $blockImages);
+    if ($sourceForAi !== '') {
+        $items = $sourceMode === 'subject'
+            ? gemini_generate_similar_questions($sourceForAi, $type, $count, $difficulty)
+            : gemini_generate_questions($sourceForAi, $type, $count, $difficulty);
+        $generated = finalize_import_preview_questions($items, $sourceForAi);
+    } else {
+        flash('Môn này chưa có dữ liệu đề/câu hỏi để AI học theo. Hãy nhập đề vào ngân hàng trước hoặc chọn chế độ nhập nội dung thủ công.', 'error');
+    }
 }
 
 $subjects = fetch_subjects();
@@ -44,9 +49,8 @@ $lessons = fetch_lessons_with_questions();
 include __DIR__ . '/includes/header.php';
 ?>
 <div class="card">
-  <h2>Tạo câu hỏi từ tài liệu</h2>
-  <p class="muted">Dán nội dung hoặc upload TXT/DOCX/PDF. Có thể đặt tên bài mới để lưu thành một bộ câu hỏi riêng trong ngân hàng.</p>
-  <form method="post" enctype="multipart/form-data">
+  <h2>Tạo câu hỏi bằng AI</h2>
+  <form method="post">
     <div class="form-row">
       <div>
         <label>Môn</label>
@@ -56,30 +60,36 @@ include __DIR__ . '/includes/header.php';
       </div>
       <div>
         <label>Bài học có sẵn</label>
-        <select name="lesson_id" data-lesson-filter="generate-lessons" data-empty-label="Mon nay chua co bai hoc tu de da upload">
+        <select name="lesson_id" data-lesson-filter="generate-lessons">
           <?php foreach ($lessons as $l): ?><option value="<?= e($l['id']) ?>" data-subject-id="<?= e($l['subject_id']) ?>" <?= $lesson === (int)$l['id'] ? 'selected' : '' ?>><?= e($l['subject_name'] . ' - ' . $l['name']) ?></option><?php endforeach; ?>
         </select>
       </div>
     </div>
-    <label>Tên bài mới nếu muốn tạo riêng cho tài liệu này</label>
-    <input name="lesson_name" value="<?= e($lessonName) ?>" placeholder="Ví dụ: Bài 3 - Đạo hàm">
+    <label>Tên bài mới nếu muốn tạo riêng</label>
+    <input name="lesson_name" value="<?= e($lessonName) ?>">
     <div class="form-row">
       <div>
-        <label>Dạng câu</label>
-        <select name="type"><?php foreach (['mixed' => 'Tổng hợp', 'mc' => 'Trắc nghiệm', 'tf' => 'Đúng/Sai', 'sa' => 'Trả lời ngắn', 'essay' => 'Tự luận'] as $k => $v): ?><option value="<?= $k ?>" <?= $type === $k ? 'selected' : '' ?>><?= $v ?></option><?php endforeach; ?></select>
+        <label>Dạng câu hỏi</label>
+        <select name="type">
+          <?php foreach (['mixed' => 'Tổng hợp', 'mc' => 'Trắc nghiệm', 'tf' => 'Đúng/Sai', 'sa' => 'Trả lời ngắn', 'essay' => 'Tự luận'] as $k => $v): ?><option value="<?= $k ?>" <?= $type === $k ? 'selected' : '' ?>><?= $v ?></option><?php endforeach; ?>
+        </select>
       </div>
       <div>
         <label>Độ khó</label>
         <select name="difficulty"><?php foreach (['easy' => 'Nhận biết', 'medium' => 'Thông hiểu', 'hard' => 'Vận dụng'] as $k => $v): ?><option value="<?= $k ?>" <?= $difficulty === $k ? 'selected' : '' ?>><?= $v ?></option><?php endforeach; ?></select>
       </div>
     </div>
+    <label>Nguồn dữ liệu tạo câu</label>
+    <select name="source_mode">
+      <option value="subject" <?= $sourceMode === 'subject' ? 'selected' : '' ?>>Tự lấy dữ liệu đề/câu hỏi đang có của môn đã chọn</option>
+      <option value="manual" <?= $sourceMode === 'manual' ? 'selected' : '' ?>>Nhập nội dung thủ công</option>
+    </select>
+    <label>Nội dung bổ sung / yêu cầu riêng</label>
+    <textarea name="source_text" placeholder="Có thể để trống nếu dùng dữ liệu môn đã chọn"><?= e($sourceText) ?></textarea>
     <div class="form-row">
-      <div><label>Số lượng</label><input type="number" name="count" value="5" min="1" max="50"></div>
-      <div><label>File TXT/DOCX/PDF</label><input type="file" name="file" accept=".txt,.docx,.pdf,application/pdf"></div>
+      <div><label>Số câu</label><input type="number" name="count" min="1" max="200" value="<?= e($count) ?>"></div>
     </div>
-    <label>Nội dung tài liệu</label>
-    <textarea name="raw_text" placeholder="Dán nội dung bài học tại đây nếu không upload file"></textarea>
-    <button class="btn primary"><span class="material-symbols-outlined">psychology</span> Tạo câu hỏi để chỉnh sửa</button>
+    <button class="btn primary"><span class="material-symbols-outlined">auto_awesome</span> Tạo câu hỏi</button>
   </form>
 </div>
 
@@ -98,18 +108,68 @@ include __DIR__ . '/includes/header.php';
         <strong>Câu <?= $i + 1 ?></strong>
         <select name="q[<?= $i ?>][type]" data-question-type><?php foreach (['mixed' => 'Tổng hợp', 'mc' => 'Trắc nghiệm', 'tf' => 'Đúng/Sai', 'sa' => 'Trả lời ngắn', 'essay' => 'Tự luận'] as $k => $v): ?><option value="<?= $k ?>" <?= $q['type'] === $k ? 'selected' : '' ?>><?= $v ?></option><?php endforeach; ?></select>
         <select name="q[<?= $i ?>][difficulty]"><?php foreach (['easy' => 'Nhận biết', 'medium' => 'Thông hiểu', 'hard' => 'Vận dụng', 'unknown' => 'Không rõ'] as $k => $v): ?><option value="<?= $k ?>" <?= $q['difficulty'] === $k ? 'selected' : '' ?>><?= $v ?></option><?php endforeach; ?></select>
-        <label class="inline-check"><input type="checkbox" name="q[<?= $i ?>][needs_review]" value="1" <?= !empty($q['needs_review']) ? 'checked' : '' ?>> Cần kiểm tra</label>
+        <button class="btn danger" type="button" data-remove-preview-question><span class="material-symbols-outlined">delete</span> Xóa câu</button>
       </div>
       <input type="hidden" name="q[<?= $i ?>][image_path]" value="<?= e($q['image_path'] ?? '') ?>">
-      <label>Nội dung</label><textarea name="q[<?= $i ?>][content]"><?= e($q['content']) ?></textarea>
-      <?= question_image_tag($q['image_path'] ?? '') ?>
+      <div class="question-content-field">
+        <?php if (question_content_has_inline_images($q['content'] ?? '')): ?>
+          <label>Nội dung</label>
+          <div class="question-content-render"><?= question_content_html($q['content'] ?? '') ?></div>
+          <input type="hidden" name="q[<?= $i ?>][content]" value="<?= e($q['content'] ?? '') ?>">
+        <?php else: ?>
+          <label>Nội dung</label><textarea name="q[<?= $i ?>][content]"><?= e($q['content'] ?? '') ?></textarea>
+        <?php endif; ?>
+        <?= question_image_tag($q['image_path'] ?? '') ?>
+      </div>
       <div class="grid grid-2 question-type-panel" data-panel="mc">
-        <?php foreach (['A', 'B', 'C', 'D'] as $o): ?><div><label>Đáp án <?= $o ?></label><input name="q[<?= $i ?>][options][<?= $o ?>]" value="<?= e($q['options'][$o] ?? '') ?>"></div><?php endforeach; ?>
+        <div data-option-list data-option-name-template="q[<?= $i ?>][options][__LABEL__]" data-answer-select="select[name='q[<?= $i ?>][answer]']">
+          <?php foreach (mc_option_labels($q['options'] ?? [], $q['answer'] ?? 'A') as $o): ?>
+            <?php $optionValue = (string)($q['options'][$o] ?? ''); ?>
+            <div class="option-row" data-option-label="<?= e($o) ?>">
+              <label>Đáp án <?= $o ?></label>
+              <?php if (question_content_has_inline_images($optionValue)): ?>
+                <div class="question-content-render option-render"><?= question_content_html($optionValue) ?></div>
+                <input type="hidden" name="q[<?= $i ?>][options][<?= $o ?>]" value="<?= e($optionValue) ?>">
+              <?php else: ?>
+                <input name="q[<?= $i ?>][options][<?= $o ?>]" value="<?= e($optionValue) ?>">
+              <?php endif; ?>
+            </div>
+          <?php endforeach; ?>
+        </div>
+        <button class="btn ghost" type="button" data-add-option><span class="material-symbols-outlined">add_circle</span> Thêm đáp án</button>
       </div>
       <div class="question-type-panel" data-panel="tf">
-        <div class="grid grid-2"><?php foreach (['a', 'b', 'c', 'd'] as $o): ?><?php $tfAnswer = (string)($q['tf_items'][$o]['answer'] ?? 'true'); ?><div><label>Ý <?= $o ?></label><input name="q[<?= $i ?>][tf_items][<?= $o ?>][content]" value="<?= e($q['tf_items'][$o]['content'] ?? '') ?>"><select name="q[<?= $i ?>][tf_items][<?= $o ?>][answer]"><option value="true" <?= $tfAnswer === 'true' ? 'selected' : '' ?>>Đúng</option><option value="false" <?= $tfAnswer === 'false' ? 'selected' : '' ?>>Sai</option></select></div><?php endforeach; ?></div>
+        <?php $tfAnswer = (string)($q['tf_answer'] ?? $q['answer'] ?? ($q['tf_items']['a']['answer'] ?? 'true')); ?>
+        <label>Đáp án Đúng/Sai</label>
+        <?php $tfItems = normalize_tf_items_array((array)($q['tf_items'] ?? []), $q['difficulty'] ?? 'unknown'); ?>
+        <?php if (!$tfItems) $tfItems = [['label'=>'a','content'=>$q['content'] ?? '','answer'=>$tfAnswer,'difficulty'=>$q['difficulty'] ?? 'unknown']]; ?>
+        <?php foreach (['a','b','c','d'] as $label): ?>
+          <?php $item = []; foreach ($tfItems as $candidate) if (($candidate['label'] ?? '') === $label) $item = $candidate; $itemAnswer = (string)($item['answer'] ?? ($label === 'a' ? $tfAnswer : 'true')); ?>
+          <?php $itemContent = (string)($item['content'] ?? ''); ?>
+          <div class="option-row">
+            <label><?= e($label) ?></label>
+            <?php if (question_content_has_inline_images($itemContent)): ?>
+              <div class="question-content-render option-render"><?= question_content_html($itemContent) ?></div>
+              <input type="hidden" name="q[<?= $i ?>][tf_items][<?= e($label) ?>][content]" value="<?= e($itemContent) ?>">
+            <?php else: ?>
+              <input name="q[<?= $i ?>][tf_items][<?= e($label) ?>][content]" value="<?= e($itemContent) ?>">
+            <?php endif; ?>
+            <select name="q[<?= $i ?>][tf_items][<?= e($label) ?>][answer]">
+              <option value="true" <?= $itemAnswer !== 'false' ? 'selected' : '' ?>>Đúng</option>
+              <option value="false" <?= $itemAnswer === 'false' ? 'selected' : '' ?>>Sai</option>
+            </select>
+          </div>
+        <?php endforeach; ?>
       </div>
-      <label>Đáp án đúng / đáp án gợi ý</label><input name="q[<?= $i ?>][answer]" value="<?= e($q['answer'] ?? '') ?>" placeholder="A/B/C/D hoặc đáp án tự luận">
+      <div class="question-type-panel" data-panel="mc-answer">
+        <label>Đáp án đúng</label>
+        <select name="q[<?= $i ?>][answer]">
+          <?php foreach (mc_option_labels($q['options'] ?? [], $q['answer'] ?? 'A') as $o): ?><option value="<?= $o ?>" <?= strtoupper((string)($q['answer'] ?? '')) === $o ? 'selected' : '' ?>><?= $o ?></option><?php endforeach; ?>
+        </select>
+      </div>
+      <div class="question-type-panel" data-panel="text">
+        <label>Đáp án gợi ý / đáp án ngắn</label><input name="q[<?= $i ?>][answer_text]" value="<?= e($q['answer'] ?? '') ?>" placeholder="Đáp án tự luận hoặc trả lời ngắn">
+      </div>
       <label>Giải thích</label><textarea name="q[<?= $i ?>][explanation]"><?= e($q['explanation'] ?? '') ?></textarea>
     </div>
   <?php endforeach; ?>

@@ -29,18 +29,23 @@ include __DIR__ . '/includes/header.php';
   </div>
   <?php foreach ($questions as $i => $q): ?>
     <div class="question">
-      <strong>Cau <?= $i + 1 ?>:</strong> <span class="muted">(<?= e($q['points']) ?> diem)</span> <?= e(display_question_content($q['content'], $q['image_path'] ?? '')) ?>
+      <strong>Cau <?= $i + 1 ?>:</strong> <span class="muted">(<?= e($q['points']) ?> diem)</span> <?= question_content_html($q['content'], $q['image_path'] ?? '') ?>
       <span class="badge <?= e($q['difficulty']) ?>"><?= difficulty_label($q['difficulty']) ?></span>
       <?= question_image_tag($q['image_path'] ?? '') ?>
 
       <?php if ($q['type'] === 'mc'): ?>
         <?php foreach (question_options($q['id']) as $op): ?>
-          <div class="choice"><?= e($op['label'] . '. ' . $op['content']) ?></div>
+          <div class="choice"><?= e($op['label'] . '. ') ?><?= question_content_html($op['content']) ?></div>
         <?php endforeach; ?>
       <?php elseif ($q['type'] === 'tf'): ?>
-        <?php foreach (tf_items($q['id']) as $it): ?>
-          <div class="choice"><?= e($it['label'] . ') ' . $it['content']) ?></div>
-        <?php endforeach; ?>
+        <?php $items = tf_items((int)$q['id']); ?>
+        <?php if ($items): ?>
+          <?php foreach ($items as $it): ?>
+            <div class="choice"><?= e($it['label'] . '. ') ?><?= question_content_html($it['content']) ?> <strong>(<?= e(tf_answer_label($it['answer'])) ?>)</strong></div>
+          <?php endforeach; ?>
+        <?php else: ?>
+          <div class="choice">Đáp án: <?= e(tf_answer_label($q['answer'] ?? 'true')) ?></div>
+        <?php endif; ?>
       <?php endif; ?>
 
       <p class="muted">Bai: <?= e($q['lesson_name']) ?> - Dap an: <?= e($q['answer']) ?></p>

@@ -228,10 +228,17 @@ include __DIR__ . '/includes/header.php';
         </div>
       </div>
       <label>Nội dung câu hỏi</label>
-      <textarea name="content" required><?= e($edit['content'] ?? '') ?></textarea>
+      <div class="question-content-field">
+        <?php if (question_content_has_inline_images($edit['content'] ?? '')): ?>
+          <div class="question-content-render"><?= question_content_html($edit['content'] ?? '') ?></div>
+          <input type="hidden" name="content" value="<?= e($edit['content'] ?? '') ?>">
+        <?php else: ?>
+          <textarea name="content" required><?= e($edit['content'] ?? '') ?></textarea>
+        <?php endif; ?>
+        <?= question_image_tag($edit['image_path'] ?? '') ?>
+      </div>
       <label>Hinh anh kem cau hoi</label>
       <input type="file" name="image_file" accept="image/png,image/jpeg,image/webp,image/gif">
-      <?= question_image_tag($edit['image_path'] ?? '') ?>
       <div class="grid grid-2 question-type-panel" data-panel="mc">
         <div>
           <h3>Đáp án trắc nghiệm</h3>
@@ -255,19 +262,25 @@ include __DIR__ . '/includes/header.php';
         </div>
       </div>
       <div class="question-type-panel" data-panel="tf">
-        <h3>Ý Đúng/Sai</h3>
-        <div class="grid grid-2">
-          <?php foreach (['a', 'b', 'c', 'd'] as $o): ?>
-            <div>
-              <label><?= $o ?>)</label>
-              <input name="tf_items[<?= $o ?>][content]" value="<?= e($editTf[$o]['content'] ?? '') ?>">
-              <select name="tf_items[<?= $o ?>][answer]">
-                <option value="true" <?= ($editTf[$o]['answer'] ?? 'true') === 'true' ? 'selected' : '' ?>>Đúng</option>
-                <option value="false" <?= ($editTf[$o]['answer'] ?? '') === 'false' ? 'selected' : '' ?>>Sai</option>
-              </select>
-            </div>
-          <?php endforeach; ?>
-        </div>
+        <?php $tfAnswer = (string)($edit['answer'] ?? ($editTf['a']['answer'] ?? 'true')); ?>
+        <h3>Đáp án Đúng/Sai</h3>
+        <?php foreach (['a','b','c','d'] as $label): ?>
+          <?php $item = $editTf[$label] ?? []; $itemAnswer = (string)($item['answer'] ?? ($label === 'a' ? $tfAnswer : 'true')); ?>
+          <?php $itemContent = (string)($item['content'] ?? ($label === 'a' ? ($edit['content'] ?? '') : '')); ?>
+          <div class="option-row">
+            <label><?= e($label) ?></label>
+            <?php if (question_content_has_inline_images($itemContent)): ?>
+              <div class="question-content-render option-render"><?= question_content_html($itemContent) ?></div>
+              <input type="hidden" name="tf_items[<?= e($label) ?>][content]" value="<?= e($itemContent) ?>">
+            <?php else: ?>
+              <input name="tf_items[<?= e($label) ?>][content]" value="<?= e($itemContent) ?>">
+            <?php endif; ?>
+            <select name="tf_items[<?= e($label) ?>][answer]">
+              <option value="true" <?= $itemAnswer !== 'false' ? 'selected' : '' ?>>Đúng</option>
+              <option value="false" <?= $itemAnswer === 'false' ? 'selected' : '' ?>>Sai</option>
+            </select>
+          </div>
+        <?php endforeach; ?>
       </div>
       <div class="question-type-panel" data-panel="text">
         <label>Đáp án gợi ý / đáp án ngắn</label>
@@ -351,7 +364,14 @@ include __DIR__ . '/includes/header.php';
                       </tr>
                       <?php foreach ($lesson['questions'] as $q): ?>
                         <tr>
-                          <td><?= e(is_image_question_placeholder($q['content'] ?? '') ? 'Câu hỏi dạng hình ảnh' : mb_strimwidth($q['content'], 0, 150, '...')) ?><?= !empty($q['image_path']) ? ' [hinh]' : '' ?><?= !empty($q['needs_review']) ? ' [can kiem tra]' : '' ?></td>
+                          <td>
+                            <?= e(is_image_question_placeholder($q['content'] ?? '') ? 'Câu hỏi dạng hình ảnh' : mb_strimwidth($q['content'], 0, 150, '...')) ?><?= !empty($q['image_path']) ? ' [hinh]' : '' ?><?= !empty($q['needs_review']) ? ' [can kiem tra]' : '' ?>
+                            <?php if ($q['type'] === 'tf'): ?>
+                              <?php foreach (tf_items((int)$q['id']) as $it): ?>
+                                <div class="muted"><?= e($it['label'] . '. ' . mb_strimwidth($it['content'], 0, 90, '...') . ' - ' . tf_answer_label($it['answer'])) ?></div>
+                              <?php endforeach; ?>
+                            <?php endif; ?>
+                          </td>
                           <td><?= type_label($q['type']) ?></td>
                           <td><span class="badge <?= e($q['difficulty']) ?>"><?= difficulty_label($q['difficulty']) ?></span></td>
                           <td class="actions">
